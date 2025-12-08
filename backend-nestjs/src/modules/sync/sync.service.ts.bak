@@ -1,0 +1,175 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { ZaloMessage } from '../../database/entities/zalo-message.entity';
+import { ZaloContact } from '../../database/entities/zalo-contact.entity';
+import { ZaloGroup } from '../../database/entities/zalo-group.entity';
+import { ZaloGroupMember } from '../../database/entities/zalo-group-member.entity';
+import { SyncMessagesDto, SyncContactsDto, SyncGroupMembersDto } from './dto/sync.dto';
+
+@Injectable()
+export class SyncService {
+  private readonly logger = new Logger(SyncService.name);
+
+  constructor(
+    @InjectRepository(ZaloMessage)
+    private messagesRepository: Repository<ZaloMessage>,
+    @InjectRepository(ZaloContact)
+    private contactsRepository: Repository<ZaloContact>,
+    @InjectRepository(ZaloGroup)
+    private groupsRepository: Repository<ZaloGroup>,
+    @InjectRepository(ZaloGroupMember)
+    private groupMembersRepository: Repository<ZaloGroupMember>,
+  ) {}
+
+  /**
+   * Sync messages from desktop agent
+   */
+  async syncMessages(userId: number, dto: SyncMessagesDto) {
+    const syncedMessages = [];
+
+    for (const msg of dto.messages) {
+      try {
+        // Check if message already exists
+        const existing = await this.messagesRepository.findOne({
+          where: {
+            zaloAccountId: msg.accountId,
+            externalMessageId: msg.messageId,
+          },
+        });
+
+        if (existing) {
+          this.logger.debug(`Message ${msg.messageId} already exists, skipping`);
+          continue;
+        }
+
+        // Create new message log
+        const message = this.messagesRepository.create({
+          zaloAccountId: msg.accountId,
+          recipientId: msg.userId,
+          content: msg.message,
+          externalMessageId: msg.messageId,
+          status: msg.status as any,
+          sentAt: new Date(msg.sentAt),
+        });
+
+        await this.messagesRepository.save(message);
+        syncedMessages.push(message);
+
+      } catch (error) {
+        this.logger.error(`Failed to sync message ${msg.messageId}: ${error.message}`);
+      }
+    }
+
+    return {
+      synced: syncedMessages.length,
+      skipped: dto.messages.length - syncedMessages.length,
+    };
+  }
+
+  /**
+   * Sync contacts from desktop agent
+   */
+  async syncContacts(userId: number, dto: SyncContactsDto) {
+    const syncedContacts = [];
+
+    for (const contactData of dto.contacts) {
+      try {
+        // Upsert contact (insert or update)
+        const contact = await this.contactsRepository.findOne({
+          where: {
+            zaloAccountId: contactData.accountId,
+            userId: contactData.userId,
+          },
+        });
+
+        if (contact) {
+          // Update existing
+          contact.displayName = contactData.displayName;
+          contact.phoneNumber = contactData.phoneNumber;
+          contact.avatar = contactData.avatar;
+          await this.contactsRepository.save(contact);
+        } else {
+          // Create new
+          const newContact = this.contactsRepository.create({
+            zaloAccountId: contactData.accountId,
+            userId: contactData.userId,
+            displayName: contactData.displayName,
+            phoneNumber: contactData.phoneNumber,
+            avatar: contactData.avatar,
+          });
+          await this.contactsRepository.save(newContact);
+        }
+
+        syncedContacts.push(contactData.userId);
+
+      } catch (error) {
+        this.logger.error(`Failed to sync contact ${contactData.userId}: ${error.message}`);
+      }
+    }
+
+    return {
+      synced: syncedContacts.length,
+    };
+  }
+
+  /**
+   * Sync group members from desktop agent
+   */
+  async syncGroupMembers(userId: number, dto: SyncGroupMembersDto) {
+    try {
+      // Upsert group
+      let group = await this.groupsRepository.findOne({
+        where: {
+          zaloAccountId: dto.accountId,
+          groupId: dto.groupId,
+        },
+      });
+
+      if (group) {
+        group.groupName = dto.groupName;
+        group.memberCount = dto.members.length;
+        group.lastScrapedAt = new Date(dto.scrapedAt);
+      } else {
+        group = this.groupsRepository.create({
+          zaloAccountId: dto.accountId,
+          groupId: dto.groupId,
+          groupName: dto.groupName,
+          memberCount: dto.members.length,
+          lastScrapedAt: new Date(dto.scrapedAt),
+        });
+      }
+
+      await this.groupsRepository.save(group);
+
+      // Delete old members and insert new ones
+      await this.groupMembersRepository.delete({
+        groupId: dto.groupId,
+        zaloAccountId: dto.accountId,
+      });
+
+      // Insert all members
+      const members = dto.members.map(member =>
+        this.groupMembersRepository.create({
+          zaloAccountId: dto.accountId,
+          groupId: dto.groupId,
+          userId: member.userId,
+          displayName: member.displayName,
+          avatar: member.avatar,
+          role: member.role as any,
+        })
+      );
+
+      await this.groupMembersRepository.save(members);
+
+      return {
+        synced: members.length,
+        groupId: dto.groupId,
+      };
+
+    } catch (error) {
+      this.logger.error(`Failed to sync group ${dto.groupId}: ${error.message}`);
+      throw error;
+    }
+  }
+}

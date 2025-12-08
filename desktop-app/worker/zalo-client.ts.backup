@@ -1,0 +1,606 @@
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { chromium, BrowserContext } from 'playwright';
+
+// Import zca-js
+const ZCA = require('zca-js');
+
+interface ZaloSession {
+  cookies: string;
+  imei: string;
+  userAgent: string;
+}
+
+export interface LoginResult {
+  success: boolean;
+  qrCode?: string;
+  data?: any;
+  error?: string;
+}
+
+export interface SendMessageResult {
+  success: boolean;
+  messageId?: string;
+  sentAt?: Date;
+  error?: string;
+}
+
+export interface ScrapeResult {
+  success: boolean;
+  data?: {
+    groupId: string;
+    groupName: string;
+    members: Array<{
+      userId: string;
+      displayName: string;
+      avatar?: string;
+      role?: string;
+    }>;
+    total: number;
+  };
+  error?: string;
+}
+
+export class ZaloClient {
+  private readonly sessionsPath: string;
+  private readonly profilesPath: string;
+  private apiInstances: Map<number, any> = new Map();
+  private loginSessions: Map<number, any> = new Map();
+
+  constructor(
+    sessionsPath: string = './data/sessions',
+    profilesPath: string = './data/browser_profiles',
+  ) {
+    this.sessionsPath = sessionsPath;
+    this.profilesPath = profilesPath;
+  }
+
+  /**
+   * Get session file path
+   */
+  private getSessionFilePath(accountId: number): string {
+    return path.join(this.sessionsPath, `${accountId}.json`);
+  }
+
+  /**
+   * Get browser profile path
+   */
+  private getProfilePath(accountId: number): string {
+    return path.join(this.profilesPath, `zalo_${accountId}`);
+  }
+
+  /**
+   * Save session to file
+   */
+  private async saveSession(accountId: number, session: ZaloSession): Promise<void> {
+    const filePath = this.getSessionFilePath(accountId);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, JSON.stringify(session, null, 2));
+    console.log(`✅ Session saved for account ${accountId}`);
+  }
+
+  /**
+   * Load session from file
+   */
+  private async loadSession(accountId: number): Promise<ZaloSession | null> {
+    try {
+      const filePath = this.getSessionFilePath(accountId);
+      const data = await fs.readFile(filePath, 'utf-8');
+      return JSON.parse(data);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Get or restore API instance
+   */
+  async getAPI(accountId: number): Promise<any> {
+    // Check if API instance exists
+    if (this.apiInstances.has(accountId)) {
+      return this.apiInstances.get(accountId);
+    }
+
+    // Try to restore from session
+    const session = await this.loadSession(accountId);
+    if (!session) {
+      throw new Error(`No session found for account ${accountId}. Please login first.`);
+    }
+
+    // Create API instance
+    const api = new ZCA.API(session.cookies, session.imei, session.userAgent);
+
+    // Verify session is still valid
+    try {
+      await api.getOwnId();
+      this.apiInstances.set(accountId, api);
+      return api;
+    } catch (error) {
+      throw new Error(`Session expired for account ${accountId}. Please login again.`);
+    }
+  }
+
+  /**
+   * Login with QR code
+   */
+  async login(accountId: number): Promise<LoginResult> {
+    try {
+      // Check if session exists
+      const existingSession = await this.loadSession(accountId);
+      if (existingSession) {
+        try {
+          const api = new ZCA.API(
+            existingSession.cookies,
+            existingSession.imei,
+            existingSession.userAgent,
+          );
+
+          const ownId = await api.getOwnId();
+          if (ownId) {
+            this.apiInstances.set(accountId, api);
+            return {
+              success: true,
+              data: { zaloId: ownId, message: 'Session restored successfully' },
+            };
+          }
+        } catch (error: any) {
+          console.warn(`Session restore failed, need new login:`, error.message);
+        }
+      }
+
+      // Use browser-based login instead of zca-js QR (more reliable)
+      return await this.loginWithBrowser(accountId);
+    } catch (error: any) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Login using browser automation (more reliable than zca-js QR)
+   */
+  async loginWithBrowser(accountId: number): Promise<LoginResult> {
+    try {
+      console.log(`🌐 Opening browser for Zalo login (account ${accountId})...`);
+
+      // Launch browser with persistent context
+      const browser = await chromium.launchPersistentContext(
+        this.getProfilePath(accountId),
+        {
+          headless: false,
+          viewport: { width: 1280, height: 720 },
+          locale: 'vi-VN',
+          args: [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-web-security',
+          ],
+        }
+      );
+
+      // Use the default page that's already created
+      const pages = browser.pages();
+      const page = pages[0];
+
+      // Navigate to Zalo chat web
+      await page.goto('https://chat.zalo.me/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000);
+
+      // Check if already logged in
+      const isLoggedIn = await page.evaluate(() => {
+        // Check for login indicators
+        return document.querySelector('[data-translate-inner="STR_PROFILE"]') !== null;
+      });
+
+      if (isLoggedIn) {
+        console.log('✅ Already logged in, extracting session...');
+
+        // Get cookies and construct session
+        const cookies = await browser.cookies();
+        const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+        // Save session
+        const zaloSession: ZaloSession = {
+          cookies: cookieString,
+          imei: '', // Will be generated by ZCA
+          userAgent: await page.evaluate(() => navigator.userAgent),
+        };
+        await this.saveSession(accountId, zaloSession);
+
+        // Try to create API instance
+        const api = new ZCA.API(cookieString, '', zaloSession.userAgent);
+        const ownId = await api.getOwnId();
+
+        if (ownId) {
+          this.apiInstances.set(accountId, api);
+          const accountInfo = await api.fetchAccountInfo();
+
+          await browser.close();
+
+          return {
+            success: true,
+            data: {
+              zaloId: ownId,
+              displayName: accountInfo.displayName || accountInfo.zaloName,
+              avatar: accountInfo.avatar,
+              message: 'Login successful',
+            },
+          };
+        }
+      }
+
+      // Not logged in yet, show QR code and wait
+      console.log('⏳ Waiting for QR scan on browser...');
+
+      // Store browser context for this login session
+      this.loginSessions.set(accountId, { browser, page });
+
+      return {
+        success: false,
+        qrCode: '', // Browser will show QR, not returning base64
+        data: {
+          message: 'Please scan QR code on the browser window',
+          isBrowserLogin: true,
+        },
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        error: `Browser login failed: ${error.message}`,
+      };
+    }
+  }
+
+  /**
+   * Check login status (polling for QR scan completion)
+   */
+  async checkLoginStatus(accountId: number): Promise<LoginResult> {
+    const session = this.loginSessions.get(accountId);
+    if (!session) {
+      return {
+        success: false,
+        error: 'No pending login session',
+      };
+    }
+
+    try {
+      // Check if this is a browser-based login
+      if (session.browser && session.page) {
+        // Check if user has logged in on browser
+        const isLoggedIn = await session.page.evaluate(() => {
+          return document.querySelector('[data-translate-inner="STR_PROFILE"]') !== null;
+        });
+
+        if (!isLoggedIn) {
+          return {
+            success: false,
+            data: { message: 'QR code not scanned yet' },
+          };
+        }
+
+        // Login successful, extract cookies
+        const cookies = await session.browser.cookies();
+        const cookieString = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+        const userAgent = await session.page.evaluate(() => navigator.userAgent);
+
+        // Save session
+        const zaloSession: ZaloSession = {
+          cookies: cookieString,
+          imei: '',
+          userAgent,
+        };
+        await this.saveSession(accountId, zaloSession);
+
+        // Create API instance
+        const api = new ZCA.API(cookieString, '', userAgent);
+        const ownId = await api.getOwnId();
+
+        if (ownId) {
+          this.apiInstances.set(accountId, api);
+          const accountInfo = await api.fetchAccountInfo();
+
+          // Close browser
+          await session.browser.close();
+
+          // Clean up login session
+          this.loginSessions.delete(accountId);
+
+          return {
+            success: true,
+            data: {
+              zaloId: ownId,
+              displayName: accountInfo.displayName || accountInfo.zaloName,
+              avatar: accountInfo.avatar,
+              message: 'Login successful',
+            },
+          };
+        }
+      }
+
+      // Legacy ZCA-based login check
+      if (session.api) {
+        const ownId = await session.api.getOwnId();
+        if (!ownId) {
+          return {
+            success: false,
+            data: { message: 'QR code not scanned yet' },
+          };
+        }
+
+        // Login successful, get account info
+        const accountInfo = await session.api.fetchAccountInfo();
+
+        // Get session data
+        const cookies = session.api.getCookies();
+        const zaloSession: ZaloSession = {
+          cookies: cookies,
+          imei: session.api.getImei(),
+          userAgent: session.api.getUserAgent(),
+        };
+
+        // Save session
+        await this.saveSession(accountId, zaloSession);
+
+        // Store API instance
+        this.apiInstances.set(accountId, session.api);
+
+        // Clean up login session
+        this.loginSessions.delete(accountId);
+
+        return {
+          success: true,
+          data: {
+            zaloId: ownId,
+            displayName: accountInfo.displayName || accountInfo.zaloName,
+            avatar: accountInfo.avatar,
+            phoneNumber: accountInfo.phoneNumber,
+            message: 'Login successful',
+          },
+        };
+      }
+
+      return {
+        success: false,
+        error: 'Invalid login session',
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Complete login after QR scan (polling)
+   */
+  async completeLogin(accountId: number): Promise<LoginResult> {
+    const session = this.loginSessions.get(accountId);
+    if (!session) {
+      return {
+        success: false,
+        error: 'No pending login session',
+      };
+    }
+
+    try {
+      const ownId = await session.api.getOwnId();
+      if (!ownId) {
+        return {
+          success: false,
+          data: { message: 'QR code not scanned yet' },
+        };
+      }
+
+      // Get session data
+      const cookies = session.api.getCookies();
+      const zaloSession: ZaloSession = {
+        cookies: cookies,
+        imei: session.api.getImei(),
+        userAgent: session.api.getUserAgent(),
+      };
+
+      // Save session
+      await this.saveSession(accountId, zaloSession);
+
+      // Store API instance
+      this.apiInstances.set(accountId, session.api);
+
+      // Clean up login session
+      this.loginSessions.delete(accountId);
+
+      return {
+        success: true,
+        data: { zaloId: ownId, message: 'Login successful' },
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Get account info
+   */
+  async getAccountInfo(accountId: number): Promise<any> {
+    const api = await this.getAPI(accountId);
+    const accountInfo = await api.fetchAccountInfo();
+
+    return {
+      profile: accountInfo.profile,
+      setting: accountInfo.setting,
+    };
+  }
+
+  /**
+   * Send message to user
+   */
+  async sendMessage(
+    accountId: number,
+    userId: string,
+    message: string,
+  ): Promise<SendMessageResult> {
+    try {
+      const api = await this.getAPI(accountId);
+      const result = await api.sendMessage(message, userId);
+
+      return {
+        success: true,
+        messageId: result.message?.msgId || result.data?.msgId,
+        sentAt: new Date(),
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Send friend request
+   */
+  async sendFriendRequest(accountId: number, userId: string, message?: string): Promise<any> {
+    const api = await this.getAPI(accountId);
+    const msg = message || 'Xin chào, tôi muốn kết bạn với bạn!';
+    const result = await api.sendFriendRequest(msg, userId);
+    return result;
+  }
+
+  /**
+   * Find user by phone number
+   */
+  async findUser(accountId: number, phoneNumber: string): Promise<any> {
+    const api = await this.getAPI(accountId);
+    const result = await api.findUser(phoneNumber);
+    return result;
+  }
+
+  /**
+   * Scrape group members using browser automation
+   * This is a simplified version - adapt from zalo-browser.service.ts
+   */
+  async scrapeGroup(
+    accountId: number,
+    groupLink: string,
+    maxMembers: number = 1000,
+  ): Promise<ScrapeResult> {
+    let browser: BrowserContext | null = null;
+
+    try {
+      console.log(`🚀 Starting group scrape for account ${accountId}`);
+
+      // Launch browser with persistent context
+      browser = await chromium.launchPersistentContext(this.getProfilePath(accountId), {
+        headless: false,
+        viewport: { width: 1280, height: 720 },
+        locale: 'vi-VN',
+      });
+
+      const page = await browser.newPage();
+      await page.goto(groupLink, { waitUntil: 'networkidle' });
+
+      // Wait for login or group page
+      await page.waitForTimeout(3000);
+
+      // Check if logged in
+      const isLoggedIn = await page.evaluate(() => {
+        return document.querySelector('[data-id]') !== null;
+      });
+
+      if (!isLoggedIn) {
+        await browser.close();
+        return {
+          success: false,
+          error: 'Not logged in. Please login to Zalo first using the browser.',
+        };
+      }
+
+      // Extract group info
+      const groupName = await page.evaluate(() => {
+        const nameEl = document.querySelector('.group-name, .profile-name');
+        return nameEl?.textContent?.trim() || 'Unknown Group';
+      });
+
+      // Extract group ID from URL or page
+      const groupId = groupLink.match(/group\/([^\/]+)/)?.[1] || 'unknown';
+
+      // Scroll and collect members
+      const members: any[] = [];
+      let lastHeight = 0;
+      let scrollAttempts = 0;
+      const maxScrollAttempts = 20;
+
+      while (members.length < maxMembers && scrollAttempts < maxScrollAttempts) {
+        // Extract current visible members
+        const currentMembers = await page.evaluate(() => {
+          const memberEls = document.querySelectorAll('[data-id]');
+          return Array.from(memberEls).map((el: any) => ({
+            userId: el.getAttribute('data-id'),
+            displayName: el.querySelector('.member-name')?.textContent?.trim() || '',
+            avatar: el.querySelector('img')?.src || '',
+          }));
+        });
+
+        // Add new members
+        currentMembers.forEach((member: any) => {
+          if (!members.find((m) => m.userId === member.userId)) {
+            members.push(member);
+          }
+        });
+
+        // Scroll down
+        await page.evaluate(() => window.scrollBy(0, 500));
+        await page.waitForTimeout(1000);
+
+        const newHeight = await page.evaluate(() => document.body.scrollHeight);
+        if (newHeight === lastHeight) {
+          scrollAttempts++;
+        } else {
+          scrollAttempts = 0;
+        }
+        lastHeight = newHeight;
+      }
+
+      await browser.close();
+
+      console.log(`✅ Scraped ${members.length} members from ${groupName}`);
+
+      return {
+        success: true,
+        data: {
+          groupId,
+          groupName,
+          members,
+          total: members.length,
+        },
+      };
+    } catch (error: any) {
+      if (browser) await browser.close();
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Logout and clear session
+   */
+  async logout(accountId: number): Promise<void> {
+    this.apiInstances.delete(accountId);
+    this.loginSessions.delete(accountId);
+
+    // Delete session file
+    try {
+      const filePath = this.getSessionFilePath(accountId);
+      await fs.unlink(filePath);
+      console.log(`✅ Session deleted for account ${accountId}`);
+    } catch (error) {
+      // Ignore if file doesn't exist
+    }
+  }
+}

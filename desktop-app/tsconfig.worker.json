@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist/worker",
+    "lib": ["ES2020", "DOM"]
+  },
+  "include": ["worker/**/*.ts"],
+  "exclude": ["worker/__tests__/**"]
+}

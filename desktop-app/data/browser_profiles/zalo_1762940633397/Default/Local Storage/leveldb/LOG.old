@@ -1,0 +1,8 @@
+2025/11/12-16:45:43.605 42f0 Reusing MANIFEST D:\Project\SourceCode\clone_akaBiz\desktop-app\data\browser_profiles\zalo_1762940633397\Default\Local Storage\leveldb/MANIFEST-000001
+2025/11/12-16:45:43.621 42f0 Recovering log #3
+2025/11/12-16:45:43.623 42f0 Level-0 table #3: started
+2025/11/12-16:45:43.641 42f0 Level-0 table #3: 76145 bytes OK
+2025/11/12-16:45:43.644 42f0 Recovering log #4
+2025/11/12-16:45:43.655 42f0 Reusing old log D:\Project\SourceCode\clone_akaBiz\desktop-app\data\browser_profiles\zalo_1762940633397\Default\Local Storage\leveldb/000004.log 
+2025/11/12-16:45:43.658 42f0 Delete type=0 #3
+2025/11/12-16:45:43.658 42f0 Delete type=2 #5

@@ -1,0 +1,3265 @@
+import React, { useState, useEffect } from 'react';
+import {
+  Box,
+  Typography,
+  Button,
+  Paper,
+  Alert,
+  CircularProgress,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  TextField,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
+  Chip,
+  Card,
+  CardContent,
+  CardActions,
+  Grid,
+  IconButton,
+  Tooltip,
+  LinearProgress,
+  Stack,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
+  Avatar,
+  Checkbox,
+} from '@mui/material';
+import {
+  Add,
+  PlayArrow,
+  Pause,
+  Stop,
+  Delete,
+  Visibility,
+  ExpandMore,
+  FileUpload,
+  FileDownload,
+  ArrowBack,
+  Refresh,
+} from '@mui/icons-material';
+import {
+  sendMessage,
+  sendFriendRequest,
+  findUser,
+  getFriendSuggestions,
+  cancelFriendRequest,
+  addMembersToGroup,
+  joinGroup,
+  getContactsWithBirthday,
+  getContactGroups,
+  getZaloAccounts,
+  getPreviousRecipients,
+  ZaloAccount,
+} from '../api/localApi';
+import {
+  CampaignType,
+  getCampaignTypesByCategory,
+  requiresTemplate,
+  requiresGroup,
+  requiresGroupMembers,
+  supportsPhoneInput,
+  supportsOptionalTemplate,
+  CATEGORY_LABELS,
+} from '../constants/campaignTypes';
+import {
+  importRecipientsFromExcel,
+  downloadBulkSendTemplate,
+} from '../utils/excelUtils';
+import {
+  utcToVietnamTime,
+  getVietnamTimeAfterMinutes,
+  vietnamInputToUTC,
+} from '../utils/dateUtils';
+import AccountSelector from './AccountSelector';
+
+interface Template {
+  id: number;
+  name: string;
+  content: string;
+  imageUrl?: string;
+  variables: string[];
+}
+
+interface Recipient {
+  userId: string; // Can be actual userId or phone number (for backward compatibility)
+  zaloId?: string; // Optional Zalo User ID - prioritized for sending
+  phoneNumber?: string; // Optional phone number - used if zaloId not available
+  displayName: string;
+  variables: Record<string, string>;
+  source?: 'phone' | 'excel' | 'group' | 'contact_group'; // Track where recipient came from
+}
+
+interface Campaign {
+  id: number;
+  accountId: number;
+  batchId?: string;
+  name: string;
+  description?: string;
+  campaignType: CampaignType;
+  templateId?: number;
+  recipients: Recipient[];
+  groupId?: string;
+  targetSource?: string;
+  automationRules?: string;
+  contactGroupId?: number;
+  scheduledAt?: string;
+  rateLimit?: number;
+  delayMs: number;
+  maxRetries: number;
+  status: 'draft' | 'scheduled' | 'pending' | 'running' | 'paused' | 'completed' | 'stopped' | 'failed';
+  totalRecipients: number;
+  sentCount: number;
+  failedCount: number;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface CampaignsPanelProps {
+  accountId?: number; // Made optional - now managed internally
+}
+
+const CampaignsPanel: React.FC<CampaignsPanelProps> = ({ accountId: propAccountId }) => {
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [accounts, setAccounts] = useState<ZaloAccount[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [dialogError, setDialogError] = useState('');
+
+  // Field-level errors for inline validation
+  const [fieldErrors, setFieldErrors] = useState({
+    name: '',
+    accountIds: '',
+    templateId: '',
+    groupId: '',
+    recipients: '',
+    scheduledAt: '',
+    groupLink: '',
+  });
+
+  const [viewMode, setViewMode] = useState<'list' | 'create'>('list');
+  const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [viewDetailsId, setViewDetailsId] = useState<number | null>(null);
+  const [groups, setGroups] = useState<any[]>([]);
+
+  // NEW: Internal account selection
+  const [selectedAccountIds, setSelectedAccountIds] = useState<number[]>([]);
+  const [formAccountIds, setFormAccountIds] = useState<number[]>([]);
+
+  const [formName, setFormName] = useState('');
+  const [formDescription, setFormDescription] = useState('');
+  const [formCampaignType, setFormCampaignType] = useState<CampaignType>('message_to_phone');
+  const [formTemplateId, setFormTemplateId] = useState<number | null>(null);
+  const [formGroupId, setFormGroupId] = useState<string>('');
+  const [formContactGroupId, setFormContactGroupId] = useState<number | null>(null);
+  const [formScheduledAt, setFormScheduledAt] = useState<string>('');
+  const [formRateLimit] = useState<number>(100);
+  const [formRecipients, setFormRecipients] = useState<Recipient[]>([]);
+  const [formDelayMs, setFormDelayMs] = useState(2000);
+  const [formMaxRetries, setFormMaxRetries] = useState(2);
+  const [contactGroups, setContactGroups] = useState<any[]>([]);
+
+  // Group members management
+  const [groupMembers, setGroupMembers] = useState<any[]>([]);
+  const [groupLoadMethod, setGroupLoadMethod] = useState<'existing' | 'link'>('existing');
+  const [groupLink, setGroupLink] = useState('');
+  const [loadingGroupMembers, setLoadingGroupMembers] = useState(false);
+
+  // Advanced rate limiting settings
+  const [formDelayBetweenMessages, setFormDelayBetweenMessages] = useState(40); // seconds
+
+  // Phone numbers input (for message_to_phone without Excel)
+  const [phoneInput, setPhoneInput] = useState('');
+  const [formMaxMessagesPerHour, setFormMaxMessagesPerHour] = useState(15);
+  const [formTimeWindowMinutes, setFormTimeWindowMinutes] = useState(60);
+  const [formRestMinutes, setFormRestMinutes] = useState(20);
+
+  // Re-marketing date filter
+  const [remarketingDateFrom, setRemarketingDateFrom] = useState<string>('');
+  const [remarketingDateTo, setRemarketingDateTo] = useState<string>('');
+  const [previousRecipients, setPreviousRecipients] = useState<any[]>([]);
+  const [loadingPreviousRecipients, setLoadingPreviousRecipients] = useState(false);
+
+  const [runningCampaignId, setRunningCampaignId] = useState<number | null>(null);
+
+  // Get active recipients based on campaign type
+  // Phone-input recipients only show for phone-based campaigns
+  const getActiveRecipients = (): Recipient[] => {
+    if (supportsPhoneInput(formCampaignType)) {
+      // For phone-based campaigns: show all recipients
+      return formRecipients;
+    } else {
+      // For non-phone campaigns: exclude phone-only recipients
+      return formRecipients.filter(r => r.source !== 'phone');
+    }
+  };
+
+  const activeRecipients = getActiveRecipients();
+
+  // Initialize with prop accountId if provided (backward compatibility)
+  useEffect(() => {
+    if (propAccountId && selectedAccountIds.length === 0) {
+      setSelectedAccountIds([propAccountId]);
+    }
+  }, [propAccountId]);
+
+  // Load accounts on mount
+  useEffect(() => {
+    loadAccounts();
+  }, []);
+
+  useEffect(() => {
+    loadCampaigns();
+    loadTemplates();
+  }, [selectedAccountIds]);
+
+  // Auto-hide success message after 5 seconds
+  useEffect(() => {
+    if (success) {
+      const timer = setTimeout(() => {
+        setSuccess('');
+      }, 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [success]);
+
+  const loadContactGroups = async (accountId: number) => {
+    try {
+      const data = await getContactGroups(accountId);
+      setContactGroups(data);
+    } catch (err: any) {
+      console.error('Failed to load contact groups:', err);
+    }
+  };
+
+  const handleLoadGroupMembers = async () => {
+    // Clear field errors
+    setFieldErrors({
+      ...fieldErrors,
+      groupId: '',
+      groupLink: '',
+      accountIds: '',
+    });
+
+    if (!formGroupId && !groupLink) {
+      setFieldErrors({
+        ...fieldErrors,
+        groupId: 'Vui lòng chọn nhóm hoặc nhập link mời nhóm',
+        groupLink: 'Vui lòng chọn nhóm hoặc nhập link mời nhóm',
+      });
+      return;
+    }
+
+    if (formAccountIds.length === 0) {
+      setFieldErrors({
+        ...fieldErrors,
+        accountIds: 'Vui lòng chọn tài khoản trước khi tải danh sách thành viên',
+      });
+      return;
+    }
+
+    // Validate group link format if using link method
+    if (groupLoadMethod === 'link' && groupLink) {
+      if (!groupLink.includes('zalo.me') && !groupLink.includes('chat.zalo.me')) {
+        setFieldErrors({
+          ...fieldErrors,
+          groupLink: 'Link không hợp lệ. Vui lòng nhập link mời nhóm Zalo',
+        });
+        return;
+      }
+    }
+
+    setLoadingGroupMembers(true);
+
+    try {
+      const accountId = formAccountIds[0];
+
+      if (groupLoadMethod === 'link' && groupLink) {
+        // Scrape group from link
+        const response = await fetch('http://localhost:3001/local/scrape-group', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accountId, groupLink }),
+        });
+
+        const result = await response.json();
+        if (!result.success) {
+          setDialogError(`❌ ${result.error || 'Không thể load thành viên nhóm từ link'}`);
+          return;
+        }
+
+        const { groupId, members } = result.data;
+        setFormGroupId(groupId);
+        setGroupMembers(members || []);
+        setSuccess(`✅ Đã load ${members.length} thành viên từ link nhóm`);
+      } else if (formGroupId) {
+        // Load members from existing joined group
+        const response = await fetch('http://localhost:3001/local/load-group-members', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accountId,
+            groupId: formGroupId,
+          }),
+        });
+
+        const result = await response.json();
+        if (!result.success) {
+          setDialogError(`❌ ${result.error || 'Không thể load thành viên nhóm'}`);
+          return;
+        }
+
+        const members = result.data || [];
+        setGroupMembers(members);
+        setSuccess(`✅ Đã load ${members.length} thành viên`);
+      }
+    } catch (err: any) {
+      console.error('Error loading group members:', err);
+      setDialogError('❌ Không thể load thành viên nhóm. Vui lòng kiểm tra kết nối và thử lại.');
+    } finally {
+      setLoadingGroupMembers(false);
+    }
+  };
+
+  const handleSelectGroupMember = (member: any) => {
+    const exists = formRecipients.some((r) => r.userId === member.userId);
+    if (exists) {
+      setFormRecipients(formRecipients.filter((r) => r.userId !== member.userId));
+    } else {
+      setFormRecipients([
+        ...formRecipients,
+        {
+          userId: member.userId,
+          displayName: member.displayName,
+          variables: {},
+          source: 'group',
+        },
+      ]);
+    }
+  };
+
+  const loadCampaigns = async () => {
+    if (selectedAccountIds.length === 0) {
+      setCampaigns([]);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Load campaigns from all selected accounts
+      const allCampaigns: Campaign[] = [];
+
+      for (const accountId of selectedAccountIds) {
+        const response = await fetch(`http://localhost:3001/local/campaigns/${accountId}`);
+        const result = await response.json();
+
+        if (result.success && result.data) {
+          allCampaigns.push(...result.data);
+        }
+      }
+
+      // Sort by creation date (newest first)
+      allCampaigns.sort((a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+
+      setCampaigns(allCampaigns);
+    } catch (err: any) {
+      console.error('Error loading campaigns:', err);
+      setError('❌ Lỗi kết nối. Vui lòng kiểm tra kết nối mạng và thử lại.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadTemplates = async () => {
+    try {
+      const response = await fetch(
+        `http://localhost:3001/local/templates?activeOnly=true`,
+      );
+      const result = await response.json();
+
+      if (result.success) {
+        setTemplates(result.data);
+      }
+    } catch (err) {
+      console.error('Failed to load templates:', err);
+    }
+  };
+
+  const loadAccounts = async () => {
+    try {
+      const data = await getZaloAccounts();
+      const activeAccounts = data.filter((acc) => acc.status === 'active');
+      setAccounts(activeAccounts);
+    } catch (err) {
+      console.error('Failed to load accounts:', err);
+    }
+  };
+
+  const loadGroups = async (accountId: number) => {
+    try {
+      const response = await fetch(`http://localhost:3001/local/groups/${accountId}`);
+      const result = await response.json();
+
+      if (result.success) {
+        setGroups(result.data);
+      }
+    } catch (err) {
+      console.error('Failed to load groups:', err);
+    }
+  };
+
+  const loadPreviousRecipientsForRemarketing = async () => {
+    if (formAccountIds.length === 0) {
+      setDialogError('Vui lòng chọn tài khoản trước');
+      return;
+    }
+
+    setLoadingPreviousRecipients(true);
+    setDialogError('');
+
+    try {
+      // For now, use the first selected account
+      const accountId = formAccountIds[0];
+      const result = await getPreviousRecipients(accountId, remarketingDateFrom, remarketingDateTo);
+
+      if (result.success && result.data) {
+        setPreviousRecipients(result.data);
+
+        // Convert to recipients format
+        const recipients: Recipient[] = result.data.map((prev) => ({
+          userId: prev.userId,
+          displayName: prev.displayName,
+          phoneNumber: prev.phoneNumber,
+          variables: {},
+          source: 'excel' as const, // Mark as excel to show in recipient list
+        }));
+
+        setFormRecipients(recipients);
+        setSuccess(`Đã tải ${recipients.length} người nhận từ các chiến dịch trước`);
+      } else {
+        setDialogError(result.error || 'Không thể tải danh sách người nhận');
+      }
+    } catch (err: any) {
+      console.error('Failed to load previous recipients:', err);
+      setDialogError(`Lỗi tải danh sách: ${err.message}`);
+    } finally {
+      setLoadingPreviousRecipients(false);
+    }
+  };
+
+  const handleOpenCreateView = () => {
+    setFormName('');
+    setFormDescription('');
+    setFormCampaignType('message_to_phone');
+    setFormTemplateId(null);
+    setFormGroupId('');
+    setFormRecipients([]);
+    setPhoneInput(''); // Clear phone input
+    setFormDelayMs(2000);
+    setFormMaxRetries(2);
+    setDialogError('');
+    setError('');
+    setGroupMembers([]);
+    setGroupLink('');
+    setFieldErrors({
+      name: '',
+      accountIds: '',
+      templateId: '',
+      groupId: '',
+      recipients: '',
+      scheduledAt: '',
+      groupLink: '',
+    });
+
+    // Initialize with selected accounts, or empty array
+    setFormAccountIds(selectedAccountIds.length > 0 ? selectedAccountIds : []);
+
+    // Set default scheduled time to 5 minutes from now in Vietnam time
+    const defaultScheduledTime = getVietnamTimeAfterMinutes(5);
+    setFormScheduledAt(defaultScheduledTime);
+
+    // Load groups and contact groups for first selected account
+    const firstAccountId = selectedAccountIds[0];
+    if (firstAccountId) {
+      loadGroups(firstAccountId);
+      loadContactGroups(firstAccountId);
+    }
+    setViewMode('create');
+  };
+
+  const handleImportRecipients = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      console.log('❌ No file selected');
+      return;
+    }
+
+    console.log('📁 File selected:', file.name);
+
+    try {
+      setLoading(true);
+      setDialogError('');
+
+      const selectedTemplateCurrent = templates.find((t) => t.id === formTemplateId);
+      const templateVariables = selectedTemplateCurrent?.variables || [];
+      console.log('📋 Template variables:', templateVariables);
+
+      const excelRecipients = await importRecipientsFromExcel(file, templateVariables);
+      console.log('📊 Excel recipients parsed:', excelRecipients.length, 'rows');
+
+      const parsedRecipients: Recipient[] = excelRecipients.map((row) => {
+        const variables: Record<string, string> = {};
+
+        // Extract template variables from Excel row
+        templateVariables.forEach((varName) => {
+          if (row[varName]) {
+            variables[varName] = row[varName];
+          }
+        });
+
+        return {
+          userId: row.userId,
+          zaloId: row.zaloId, // Optional - from [ZALOID] column
+          phoneNumber: row.phoneNumber, // Optional - from [MOBILE] column
+          displayName: row.displayName,
+          variables,
+          source: 'excel', // Mark as Excel import source
+        };
+      });
+
+      console.log('✅ Parsed recipients:', parsedRecipients);
+      setFormRecipients(parsedRecipients);
+      setSuccess(`Đã tải ${parsedRecipients.length} người nhận từ Excel`);
+    } catch (err: any) {
+      console.error('❌ Import error:', err);
+      setDialogError(err.message || 'Không thể đọc file Excel. Vui lòng kiểm tra lại file.');
+    } finally {
+      setLoading(false);
+      event.target.value = '';
+    }
+  };
+
+  const handleAddPhoneNumbers = () => {
+    if (!phoneInput.trim()) {
+      setDialogError('Vui lòng nhập số điện thoại');
+      return;
+    }
+
+    setDialogError('');
+
+    // Parse phone numbers from input (split by comma only)
+    const phoneNumbers = phoneInput
+      .split(',')
+      .map(phone => phone.trim())
+      .filter(phone => phone.length > 0);
+
+    if (phoneNumbers.length === 0) {
+      setDialogError('Không tìm thấy số điện thoại hợp lệ');
+      return;
+    }
+
+    // Convert phone numbers to recipients
+    const newRecipients: Recipient[] = phoneNumbers.map((phone) => ({
+      userId: phone, // Will be used to find user via findUser API
+      phoneNumber: phone,
+      displayName: phone, // Temporary display name
+      variables: {},
+      source: 'phone', // Mark as phone input source
+    }));
+
+    // Add to existing recipients (avoid duplicates)
+    const existingPhones = new Set(formRecipients.map(r => r.phoneNumber || r.userId));
+    const uniqueNewRecipients = newRecipients.filter(r => !existingPhones.has(r.phoneNumber || r.userId));
+
+    if (uniqueNewRecipients.length === 0) {
+      setDialogError('Tất cả số điện thoại đã tồn tại trong danh sách');
+      return;
+    }
+
+    setFormRecipients([...formRecipients, ...uniqueNewRecipients]);
+    setSuccess(`✅ Đã thêm ${uniqueNewRecipients.length} số điện thoại (${phoneNumbers.length - uniqueNewRecipients.length} trùng lặp)`);
+    setPhoneInput(''); // Clear input
+  };
+
+  const handleCreateCampaign = async () => {
+    // Clear all previous errors
+    setDialogError('');
+    setFieldErrors({
+      name: '',
+      accountIds: '',
+      templateId: '',
+      groupId: '',
+      recipients: '',
+      scheduledAt: '',
+      groupLink: '',
+    });
+
+    let hasError = false;
+    const newErrors = { ...fieldErrors };
+
+    // Validation
+    if (!formName.trim()) {
+      newErrors.name = 'Vui lòng nhập tên chiến dịch';
+      hasError = true;
+    }
+
+    if (formAccountIds.length === 0) {
+      newErrors.accountIds = 'Vui lòng chọn ít nhất một tài khoản để tạo chiến dịch';
+      hasError = true;
+    }
+
+    if (requiresTemplate(formCampaignType) && !formTemplateId) {
+      newErrors.templateId = 'Loại chiến dịch này yêu cầu chọn template tin nhắn';
+      hasError = true;
+    }
+
+    if (requiresGroup(formCampaignType) && !formGroupId) {
+      newErrors.groupId = 'Vui lòng chọn nhóm hoặc tải danh sách thành viên từ link mời nhóm';
+      hasError = true;
+    }
+
+    // For campaigns that need group members, check if members are loaded
+    if (requiresGroupMembers(formCampaignType)) {
+      if (activeRecipients.length === 0) {
+        newErrors.recipients = 'Vui lòng tải danh sách thành viên nhóm bằng cách bấm nút "Tải danh sách thành viên"';
+        hasError = true;
+      } else {
+        console.log(`✅ Loaded ${activeRecipients.length} group members for campaign`);
+      }
+    }
+
+    // For "add_to_group" campaign, need recipients to add to the group
+    if (formCampaignType === 'add_to_group') {
+      if (activeRecipients.length === 0 && !formContactGroupId) {
+        newErrors.recipients = 'Vui lòng thêm danh sách người dùng sẽ được thêm vào nhóm';
+        hasError = true;
+      }
+    }
+
+    // For non-group-based campaigns (except message_to_group which only sends to group chat), check recipients
+    if (!requiresGroup(formCampaignType) && activeRecipients.length === 0 && !formContactGroupId) {
+      newErrors.recipients = 'Vui lòng thêm người nhận hoặc chọn nhóm danh bạ';
+      hasError = true;
+    }
+
+    // Validate scheduled time if provided
+    if (formScheduledAt) {
+      const scheduledTime = new Date(formScheduledAt);
+      const now = new Date();
+      if (scheduledTime <= now) {
+        newErrors.scheduledAt = 'Thời gian hẹn giờ phải là thời điểm trong tương lai';
+        hasError = true;
+      }
+    }
+
+    // If there are errors, update state and return
+    if (hasError) {
+      setFieldErrors(newErrors);
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      // Convert scheduledAt from Vietnam time (UTC+7) to UTC for database
+      const scheduledAtUTC = formScheduledAt ? vietnamInputToUTC(formScheduledAt) : undefined;
+
+      const batchId = formAccountIds.length > 1 ? `batch_${Date.now()}` : undefined;
+
+      let successCount = 0;
+      const errors: string[] = [];
+
+      for (let i = 0; i < formAccountIds.length; i++) {
+        const accountId = formAccountIds[i];
+
+        let accountRecipients: Recipient[] = [];
+
+        // If using contact group, don't divide recipients (backend will load from group)
+        if (formContactGroupId) {
+          accountRecipients = [];
+        } else {
+          // Divide recipients evenly across accounts (use activeRecipients for current campaign type)
+          const recipientsPerAccount = Math.ceil(activeRecipients.length / formAccountIds.length);
+          const startIdx = i * recipientsPerAccount;
+          const endIdx = Math.min(startIdx + recipientsPerAccount, activeRecipients.length);
+          accountRecipients = activeRecipients.slice(startIdx, endIdx);
+        }
+
+        // Skip if no recipients and no contact group
+        if (accountRecipients.length === 0 && !formContactGroupId) continue;
+
+        const campaignName = formAccountIds.length > 1
+          ? `${formName.trim()} (${i + 1}/${formAccountIds.length})`
+          : formName.trim();
+
+        try {
+          const response = await fetch('http://localhost:3001/local/campaigns', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              accountId,
+              batchId,
+              name: campaignName,
+              description: formDescription.trim() || undefined,
+              campaignType: formCampaignType,
+              templateId: formTemplateId || undefined,
+              recipients: accountRecipients,
+              groupId: formGroupId || undefined,
+              contactGroupId: formContactGroupId || undefined,
+              scheduledAt: scheduledAtUTC,
+              rateLimit: formRateLimit || undefined,
+              delayMs: formDelayMs,
+              maxRetries: formMaxRetries,
+            }),
+          });
+
+          const result = await response.json();
+
+          if (result.success) {
+            successCount++;
+            console.log(`Campaign created for account ${accountId}:`, result.data);
+          } else {
+            errors.push(`Account ${accountId}: ${result.error || 'Unknown error'}`);
+          }
+        } catch (err: any) {
+          errors.push(`Account ${accountId}: ${err.message}`);
+        }
+      }
+
+      if (successCount > 0) {
+        const message = formAccountIds.length > 1
+          ? `✅ Đã tạo ${successCount}/${formAccountIds.length} chiến dịch thành công${errors.length > 0 ? ` (${errors.length} lỗi)` : ''}`
+          : '✅ Đã tạo chiến dịch thành công';
+
+        setSuccess(message);
+        handleCloseDialog();
+        loadCampaigns();
+
+        // Switch to list view to show success message
+        setViewMode('list');
+      } else {
+        setDialogError(`❌ Không thể tạo chiến dịch: ${errors.join(', ')}`);
+      }
+    } catch (err: any) {
+      console.error('Error creating campaigns:', err);
+      setDialogError('❌ Không thể tạo chiến dịch. Vui lòng thử lại.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteCampaign = async (id: number) => {
+    setLoading(true);
+    try {
+      const response = await fetch(`http://localhost:3001/local/campaigns/${id}`, {
+        method: 'DELETE',
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        console.log('Campaign deleted successfully:', id);
+        setSuccess('✅ Đã xóa chiến dịch thành công');
+        setDeleteConfirmId(null);
+        loadCampaigns();
+      } else {
+        console.error('Delete campaign failed:', result);
+        setError('❌ Không thể xóa chiến dịch. Vui lòng thử lại.');
+      }
+    } catch (err: any) {
+      console.error('Error deleting campaign:', err);
+      setError('❌ Không thể xóa chiến dịch. Vui lòng kiểm tra kết nối và thử lại.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleStartCampaign = async (campaign: Campaign) => {
+    setRunningCampaignId(campaign.id);
+
+    // If this campaign is part of a batch, start all campaigns in the batch
+    if (campaign.batchId) {
+      const batchCampaigns = campaigns.filter(
+        (c) => c.batchId === campaign.batchId && c.status === 'pending'
+      );
+
+      console.log(`🚀 Starting batch ${campaign.batchId} with ${batchCampaigns.length} campaigns`);
+
+      // Start all campaigns in the batch concurrently
+      const startPromises = batchCampaigns.map(async (batchCampaign) => {
+        await fetch(`http://localhost:3001/local/campaigns/${batchCampaign.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            status: 'running',
+            startedAt: new Date().toISOString(),
+          }),
+        });
+
+        // Execute campaign in background
+        executeCampaignInBackground(batchCampaign);
+      });
+
+      await Promise.all(startPromises);
+      loadCampaigns();
+
+      return; // Don't execute campaign.id again since it's already started above
+    }
+
+    // Single campaign (not part of batch)
+    // Update campaign status to running
+    await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status: 'running',
+        startedAt: new Date().toISOString(),
+      }),
+    });
+
+    loadCampaigns();
+
+    try {
+      // Execute based on campaign type
+      switch (campaign.campaignType) {
+        case 'message_to_phone':
+          await executeMessageToPhoneCampaign(campaign);
+          break;
+        case 'message_to_friends':
+          await executeMessageToFriendsCampaign(campaign);
+          break;
+        case 'message_to_group_members':
+          await executeMessageToGroupMembersCampaign(campaign);
+          break;
+        case 'message_to_group':
+          await executeMessageToGroupCampaign(campaign);
+          break;
+        case 'message_birthday':
+          await executeMessageBirthdayCampaign(campaign);
+          break;
+        case 'friend_request_phone':
+          await executeFriendRequestPhoneCampaign(campaign);
+          break;
+        case 'friend_request_group':
+          await executeFriendRequestGroupCampaign(campaign);
+          break;
+        case 'friend_request_suggestions':
+          await executeFriendRequestSuggestionsCampaign(campaign);
+          break;
+        case 'invite_friend':
+          await executeInviteFriendCampaign(campaign);
+          break;
+        case 'cancel_invite_friend':
+          await executeCancelInviteFriendCampaign(campaign);
+          break;
+        case 'add_to_group':
+          await executeAddToGroupCampaign(campaign);
+          break;
+        case 'join_group_by_link':
+          await executeJoinGroupByLinkCampaign(campaign);
+          break;
+        default:
+          setError(`Loại chiến dịch ${campaign.campaignType} chưa được hỗ trợ`);
+          return;
+      }
+
+      // Mark as completed
+      await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        }),
+      });
+
+      console.log('Campaign completed successfully:', campaign.id);
+      setRunningCampaignId(null);
+      loadCampaigns();
+      setSuccess('Chiến dịch đã hoàn thành');
+    } catch (error: any) {
+      console.error('Error executing campaign:', error);
+      setError('Không thể thực hiện chiến dịch. Vui lòng thử lại.');
+      setRunningCampaignId(null);
+      loadCampaigns();
+    }
+  };
+
+  // Helper function to check pause/stop status
+  // Helper function to execute campaign in background
+  const executeCampaignInBackground = async (campaign: Campaign) => {
+    try {
+      switch (campaign.campaignType) {
+        case 'message_to_phone':
+          await executeMessageToPhoneCampaign(campaign);
+          break;
+        case 'message_to_friends':
+          await executeMessageToFriendsCampaign(campaign);
+          break;
+        case 'message_to_group_members':
+          await executeMessageToGroupMembersCampaign(campaign);
+          break;
+        case 'message_to_group':
+          await executeMessageToGroupCampaign(campaign);
+          break;
+        case 'message_birthday':
+          await executeMessageBirthdayCampaign(campaign);
+          break;
+        case 'friend_request_phone':
+          await executeFriendRequestPhoneCampaign(campaign);
+          break;
+        case 'friend_request_group':
+          await executeFriendRequestGroupCampaign(campaign);
+          break;
+        case 'friend_request_suggestions':
+          await executeFriendRequestSuggestionsCampaign(campaign);
+          break;
+        case 'invite_friend':
+          await executeInviteFriendCampaign(campaign);
+          break;
+        case 'cancel_invite_friend':
+          await executeCancelInviteFriendCampaign(campaign);
+          break;
+        case 'add_to_group':
+          await executeAddToGroupCampaign(campaign);
+          break;
+        case 'join_group_by_link':
+          await executeJoinGroupByLinkCampaign(campaign);
+          break;
+        default:
+          console.error(`❌ Unsupported campaign type: ${campaign.campaignType}`);
+          return;
+      }
+
+      // Mark campaign as completed
+      await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+        }),
+      });
+
+      console.log(`✅ Campaign ${campaign.id} completed successfully`);
+    } catch (err: any) {
+      console.error(`❌ Campaign ${campaign.id} failed:`, err);
+
+      // Mark campaign as failed
+      await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: 'failed',
+        }),
+      });
+    } finally {
+      loadCampaigns();
+    }
+  };
+
+  const checkCampaignStatus = async (campaignId: number): Promise<boolean> => {
+    const current = campaigns.find((c) => c.id === campaignId);
+    if (current?.status === 'stopped') return false;
+
+    while (current?.status === 'paused') {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await loadCampaigns();
+    }
+    return true;
+  };
+
+  // Helper function to get user info from Zalo API
+  const getUserInfo = async (accountId: number, userId: string): Promise<any | null> => {
+    try {
+      const response = await fetch('http://localhost:3001/local/get-user-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountId, userId }),
+      });
+
+      const result = await response.json();
+      if (result.success) {
+        return result.data;
+      }
+      return null;
+    } catch (err) {
+      console.error('Failed to get user info:', err);
+      return null;
+    }
+  };
+
+  // Helper function to determine vocative (anh/chị/bạn) from gender
+  const getVocative = (gender: number | undefined): string => {
+    if (gender === 0) return 'anh'; // Male
+    if (gender === 1) return 'chị'; // Female
+    return 'bạn'; // Unknown
+  };
+
+  // Helper function to capitalize first letter
+  const capitalizeFirst = (str: string): string => {
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  };
+
+  // Helper function to generate default variables from user profile
+  const generateDefaultVariables = (userProfile: any): Record<string, string> => {
+    const displayName = userProfile.displayName || userProfile.zaloName || 'Bạn';
+    const zaloName = userProfile.zaloName || userProfile.displayName || 'Bạn';
+    const vocative = getVocative(userProfile.gender);
+
+    // Log để debug gender detection
+    console.log(`📋 User profile - Name: ${displayName}, Gender: ${userProfile.gender} (${userProfile.gender === 0 ? 'Nam' : userProfile.gender === 1 ? 'Nữ' : 'Không xác định'}), Vocative: ${vocative}`);
+
+    return {
+      // Tên hiển thị gốc trên Zalo
+      FULLNAME_WEB: displayName,
+      // Tên Zalo nguyên gốc
+      FULLNAME_ORIGINAL: zaloName,
+      // Xưng hô: anh/chị/bạn
+      vocative_web: vocative,                    // anh/chị (viết thường)
+      Vocative_web: capitalizeFirst(vocative),   // Anh/Chị (viết hoa chữ đầu)
+      VOCATIVE_WEB: vocative.toUpperCase(),      // ANH/CHỊ (viết hoa toàn bộ)
+    };
+  };
+
+  // Helper function to replace variables in template
+  const replaceVariables = (content: string, variables: Record<string, string>): string => {
+    // Split by "|" to get message variants
+    const variants = content.split('|').map((v) => v.trim());
+
+    // Randomly select one variant
+    const selectedVariant = variants[Math.floor(Math.random() * variants.length)];
+
+    // Replace variables with [] syntax
+    let result = selectedVariant;
+    Object.keys(variables).forEach((key) => {
+      const regex = new RegExp(`\\[${key}\\]`, 'g');
+      result = result.replace(regex, variables[key] || '');
+    });
+
+    return result;
+  };
+
+  // 1. MESSAGE_TO_PHONE: Find user by phone then send message
+  const executeMessageToPhoneCampaign = async (campaign: Campaign) => {
+    const template = templates.find((t) => t.id === campaign.templateId);
+    if (!template) {
+      console.error('Template not found for campaign:', campaign.id);
+      throw new Error('Không tìm thấy template');
+    }
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Determine target userId
+          let targetUserId: string;
+
+          if (recipient.zaloId) {
+            // Priority 1: Use zaloId directly if available (skip findUser step)
+            targetUserId = recipient.zaloId;
+          } else {
+            // Priority 2: Find user by phone number or userId
+            const phoneOrUserId = recipient.phoneNumber || recipient.userId;
+            const findResult = await findUser(campaign.accountId, phoneOrUserId);
+            if (!findResult.success || !findResult.user) {
+              throw new Error('Không tìm thấy người dùng');
+            }
+            targetUserId = findResult.user.userId;
+          }
+
+          // Get user info from Zalo to get default variables
+          const userProfile = await getUserInfo(campaign.accountId, targetUserId);
+          const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+
+          // Merge default variables with custom variables (custom variables override defaults)
+          const allVariables = { ...defaultVariables, ...recipient.variables };
+
+          // Send message (with optional image)
+          const message = replaceVariables(template.content, allVariables);
+          const sendResult = await sendMessage(campaign.accountId, targetUserId, message, template.imageUrl);
+
+          if (sendResult.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(sendResult.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 2. MESSAGE_TO_FRIENDS: Send message to friend list
+  const executeMessageToFriendsCampaign = async (campaign: Campaign) => {
+    const template = templates.find((t) => t.id === campaign.templateId);
+    if (!template) {
+      console.error('Template not found for campaign:', campaign.id);
+      throw new Error('Không tìm thấy template');
+    }
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Get user info from Zalo to get default variables
+          const userProfile = await getUserInfo(campaign.accountId, recipient.userId);
+          const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+
+          // Merge default variables with custom variables (custom variables override defaults)
+          const allVariables = { ...defaultVariables, ...recipient.variables };
+
+          const message = replaceVariables(template.content, allVariables);
+          const result = await sendMessage(campaign.accountId, recipient.userId, message, template.imageUrl);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 3. MESSAGE_TO_GROUP_MEMBERS: Send private message to each group member
+  const executeMessageToGroupMembersCampaign = async (campaign: Campaign) => {
+    const template = templates.find((t) => t.id === campaign.templateId);
+    if (!template) {
+      console.error('Template not found for campaign:', campaign.id);
+      throw new Error('Không tìm thấy template');
+    }
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    // Recipients should be group members
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // For group members, userId should already be the Zalo User ID
+          // But we still support zaloId field for consistency with other campaign types
+          const targetUserId = recipient.zaloId || recipient.userId;
+
+          // Get user info from Zalo to get default variables
+          const userProfile = await getUserInfo(campaign.accountId, targetUserId);
+          const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+
+          // Merge default variables with custom variables (custom variables override defaults)
+          const allVariables = { ...defaultVariables, ...recipient.variables };
+
+          const message = replaceVariables(template.content, allVariables);
+          const result = await sendMessage(campaign.accountId, targetUserId, message, template.imageUrl);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 4. MESSAGE_TO_GROUP: Send message to group chat
+  const executeMessageToGroupCampaign = async (campaign: Campaign) => {
+    const template = templates.find((t) => t.id === campaign.templateId);
+    if (!template) {
+      console.error('Template not found for campaign:', campaign.id);
+      throw new Error('Không tìm thấy template');
+    }
+    if (!campaign.groupId) {
+      console.error('GroupId missing for campaign:', campaign.id);
+      throw new Error('Không có groupId');
+    }
+
+    const message = replaceVariables(template.content, {});
+    const result = await sendMessage(campaign.accountId, campaign.groupId, message, template.imageUrl);
+
+    if (result.success) {
+      await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sentCount: 1 }),
+      });
+    } else {
+      await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ failedCount: 1 }),
+      });
+      throw new Error(result.error);
+    }
+  };
+
+  // 5. MESSAGE_BIRTHDAY: Auto send birthday messages
+  const executeMessageBirthdayCampaign = async (campaign: Campaign) => {
+    const template = templates.find((t) => t.id === campaign.templateId);
+    if (!template) {
+      console.error('Template not found for campaign:', campaign.id);
+      throw new Error('Không tìm thấy template');
+    }
+
+    // Get contacts with birthday today
+    const result = await getContactsWithBirthday(campaign.accountId, true);
+    if (!result.success || !result.data || result.data.length === 0) {
+      console.warn('No birthday contacts found for campaign:', campaign.id);
+      throw new Error('Không có ai sinh nhật hôm nay');
+    }
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < result.data.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const contact = result.data[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Get user info from Zalo to get default variables
+          const userProfile = await getUserInfo(campaign.accountId, contact.userId);
+          const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+
+          // Merge with birthday-specific variables
+          const allVariables = {
+            ...defaultVariables,
+            name: contact.displayName,
+            displayName: contact.displayName,
+          };
+
+          const message = replaceVariables(template.content, allVariables);
+          const sendResult = await sendMessage(campaign.accountId, contact.userId, message, template.imageUrl);
+
+          if (sendResult.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(sendResult.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < result.data.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 6. FRIEND_REQUEST_PHONE: Send friend request by phone
+  const executeFriendRequestPhoneCampaign = async (campaign: Campaign) => {
+    // Get template if provided (optional for friend_request campaigns)
+    const template = campaign.templateId ? templates.find((t) => t.id === campaign.templateId) : null;
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Find user by phone
+          const findResult = await findUser(campaign.accountId, recipient.userId);
+          if (!findResult.success || !findResult.user) {
+            throw new Error('Không tìm thấy người dùng');
+          }
+
+          // Prepare greeting message
+          let message: string;
+          if (template) {
+            // Use template with variables
+            const userProfile = await getUserInfo(campaign.accountId, findResult.user.userId);
+            const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+            const allVariables = { ...defaultVariables, ...recipient.variables };
+            message = replaceVariables(template.content, allVariables);
+          } else {
+            // Use default Zalo greeting or custom message
+            message = recipient.variables.message || 'Xin chào, kết bạn với tôi nhé!';
+          }
+
+          // Send friend request
+          const result = await sendFriendRequest(campaign.accountId, findResult.user.userId, message);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 7. FRIEND_REQUEST_GROUP: Send friend request to group members
+  const executeFriendRequestGroupCampaign = async (campaign: Campaign) => {
+    // Get template if provided (optional for friend_request campaigns)
+    const template = campaign.templateId ? templates.find((t) => t.id === campaign.templateId) : null;
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Prepare greeting message
+          let message: string;
+          if (template) {
+            // Use template with variables
+            const userProfile = await getUserInfo(campaign.accountId, recipient.userId);
+            const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+            const allVariables = { ...defaultVariables, ...recipient.variables };
+            message = replaceVariables(template.content, allVariables);
+          } else {
+            // Use default Zalo greeting or custom message
+            message = recipient.variables.message || 'Xin chào, kết bạn với tôi nhé!';
+          }
+
+          const result = await sendFriendRequest(campaign.accountId, recipient.userId, message);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 8. FRIEND_REQUEST_SUGGESTIONS: Send friend request to Zalo suggestions
+  const executeFriendRequestSuggestionsCampaign = async (campaign: Campaign) => {
+    // Get template if provided (optional for friend_request campaigns)
+    const template = campaign.templateId ? templates.find((t) => t.id === campaign.templateId) : null;
+
+    // Get friend suggestions from Zalo
+    const suggestionsResult = await getFriendSuggestions(campaign.accountId, 50);
+    if (!suggestionsResult.success || !suggestionsResult.data || suggestionsResult.data.length === 0) {
+      console.warn('No friend suggestions found for campaign:', campaign.id);
+      throw new Error('Không có gợi ý kết bạn từ Zalo');
+    }
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+    const suggestions = suggestionsResult.data;
+
+    // Limit to recipients count if specified
+    const maxCount = campaign.totalRecipients || suggestions.length;
+    const limitedSuggestions = suggestions.slice(0, maxCount);
+
+    for (let i = sentCount + failedCount; i < limitedSuggestions.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const suggestion = limitedSuggestions[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Prepare greeting message
+          let message: string;
+          if (template) {
+            // Use template with variables
+            const userProfile = await getUserInfo(campaign.accountId, suggestion.userId);
+            const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+            message = replaceVariables(template.content, defaultVariables);
+          } else {
+            // Use default Zalo greeting
+            message = 'Xin chào, kết bạn với tôi nhé!';
+          }
+
+          const result = await sendFriendRequest(campaign.accountId, suggestion.userId, message);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < limitedSuggestions.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 9. INVITE_FRIEND: Send friend invitation
+  const executeInviteFriendCampaign = async (campaign: Campaign) => {
+    // Get template if provided (optional for friend_request campaigns)
+    const template = campaign.templateId ? templates.find((t) => t.id === campaign.templateId) : null;
+
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          // Prepare greeting message
+          let message: string;
+          if (template) {
+            // Use template with variables
+            const userProfile = await getUserInfo(campaign.accountId, recipient.userId);
+            const defaultVariables = userProfile ? generateDefaultVariables(userProfile) : {};
+            const allVariables = { ...defaultVariables, ...recipient.variables };
+            message = replaceVariables(template.content, allVariables);
+          } else {
+            // Use default Zalo greeting or custom message from recipient
+            message = recipient.variables.message || 'Xin chào, kết bạn với tôi nhé!';
+          }
+
+          const result = await sendFriendRequest(campaign.accountId, recipient.userId, message);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 10. CANCEL_INVITE_FRIEND: Cancel sent friend requests
+  const executeCancelInviteFriendCampaign = async (campaign: Campaign) => {
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          const result = await cancelFriendRequest(campaign.accountId, recipient.userId);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  // 11. ADD_TO_GROUP: Add members to group
+  const executeAddToGroupCampaign = async (campaign: Campaign) => {
+    if (!campaign.groupId) {
+      console.error('GroupId missing for campaign:', campaign.id);
+      throw new Error('Không có groupId');
+    }
+
+    // Get all userIds from recipients
+    const userIds = campaign.recipients.map((r) => r.userId);
+
+    // Add all members to group at once
+    const result = await addMembersToGroup(campaign.accountId, campaign.groupId, userIds);
+
+    if (result.success && result.data) {
+      console.log('Members added to group:', result.data);
+      // Update campaign with results
+      await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sentCount: result.data.successCount,
+          failedCount: result.data.failedCount,
+        }),
+      });
+    } else {
+      console.error('Add members to group failed:', result);
+      throw new Error(result.error || 'Không thể thêm thành viên vào group');
+    }
+
+    await loadCampaigns();
+  };
+
+  // 12. JOIN_GROUP_BY_LINK: Join group by link
+  const executeJoinGroupByLinkCampaign = async (campaign: Campaign) => {
+    let sentCount = campaign.sentCount;
+    let failedCount = campaign.failedCount;
+
+    // Recipients should contain group links in userId field
+    for (let i = sentCount + failedCount; i < campaign.recipients.length; i++) {
+      const shouldContinue = await checkCampaignStatus(campaign.id);
+      if (!shouldContinue) break;
+
+      const recipient = campaign.recipients[i];
+      const groupLink = recipient.userId; // Link is stored in userId field
+      let attempts = 0;
+      let success = false;
+
+      while (attempts <= campaign.maxRetries && !success) {
+        try {
+          const result = await joinGroup(campaign.accountId, groupLink);
+
+          if (result.success) {
+            success = true;
+            sentCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sentCount }),
+            });
+          } else {
+            throw new Error(result.error);
+          }
+        } catch (err: any) {
+          attempts++;
+          if (attempts > campaign.maxRetries) {
+            failedCount++;
+            await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ failedCount }),
+            });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+
+      if (i < campaign.recipients.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, campaign.delayMs));
+      }
+      await loadCampaigns();
+    }
+  };
+
+  const handlePauseCampaign = async (id: number) => {
+    await fetch(`http://localhost:3001/local/campaigns/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'paused' }),
+    });
+    loadCampaigns();
+  };
+
+  const handleResumeCampaign = async (campaign: Campaign) => {
+    await fetch(`http://localhost:3001/local/campaigns/${campaign.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'running' }),
+    });
+    handleStartCampaign(campaign);
+  };
+
+  const handleStopCampaign = async (id: number) => {
+    await fetch(`http://localhost:3001/local/campaigns/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status: 'stopped',
+        completedAt: new Date().toISOString(),
+      }),
+    });
+    setRunningCampaignId(null);
+    loadCampaigns();
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'draft':
+        return 'default';
+      case 'scheduled':
+        return 'info';
+      case 'running':
+        return 'primary';
+      case 'paused':
+        return 'warning';
+      case 'completed':
+        return 'success';
+      case 'stopped':
+        return 'error';
+      default:
+        return 'default';
+    }
+  };
+
+  const getStatusLabel = (status: string) => {
+    switch (status) {
+      case 'draft':
+        return 'Nháp';
+      case 'scheduled':
+        return 'Đã lên lịch';
+      case 'running':
+        return 'Đang chạy';
+      case 'paused':
+        return 'Tạm dừng';
+      case 'completed':
+        return 'Hoàn thành';
+      case 'stopped':
+        return 'Đã dừng';
+      default:
+        return status;
+    }
+  };
+
+  // Group campaigns by account
+  const groupedCampaigns = campaigns.reduce((acc, campaign) => {
+    const accountId = campaign.accountId;
+    if (!acc[accountId]) {
+      acc[accountId] = [];
+    }
+    acc[accountId].push(campaign);
+    return acc;
+  }, {} as Record<number, Campaign[]>);
+
+  return (
+    <Box sx={{ p: 3 }}>
+      {viewMode === 'list' ? (
+        <>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
+            <Typography variant="h5" fontWeight="bold">
+              Quản Lý Chiến Dịch
+            </Typography>
+            <Button variant="contained" startIcon={<Add />} onClick={handleOpenCreateView}>
+              Tạo Chiến Dịch
+            </Button>
+          </Box>
+
+          {/* Account Selector */}
+          <AccountSelector
+        mode="multiple"
+        value={selectedAccountIds}
+        onChange={(ids) => setSelectedAccountIds(ids as number[])}
+        label="Chọn tài khoản để xem chiến dịch"
+        helperText="Chọn nhiều tài khoản để xem tất cả chiến dịch của các tài khoản đó"
+      />
+
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>
+          {error}
+        </Alert>
+      )}
+
+      {success && (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess('')}>
+          {success}
+        </Alert>
+      )}
+
+      {loading && !openDialog && (
+        <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}>
+          <CircularProgress />
+        </Box>
+      )}
+
+      {/* Grouped Campaigns by Account */}
+      {Object.entries(groupedCampaigns).map(([accountIdStr, accountCampaigns]) => {
+        const accountId = parseInt(accountIdStr);
+        const account = accounts.find((acc) => acc.id === accountId);
+
+        return (
+          <Box key={accountId} sx={{ mb: 4 }}>
+            {/* Account Header */}
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                mb: 2,
+                pb: 1,
+                borderBottom: 2,
+                borderColor: 'primary.main',
+              }}
+            >
+              <Avatar
+                src={account?.avatar}
+                alt={account?.displayName}
+                sx={{ width: 40, height: 40, mr: 2 }}
+              />
+              <Box sx={{ flex: 1 }}>
+                <Typography variant="h6" fontWeight="bold">
+                  {account?.displayName || `Tài khoản ${accountId}`}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {accountCampaigns.length} chiến dịch
+                  {account?.phoneNumber && ` • ${account.phoneNumber}`}
+                </Typography>
+              </Box>
+            </Box>
+
+            {/* Campaigns Grid for this Account */}
+            <Grid container spacing={2}>
+              {accountCampaigns.map((campaign) => {
+                const template = templates.find((t) => t.id === campaign.templateId);
+                const progress =
+                  campaign.totalRecipients > 0
+                    ? ((campaign.sentCount + campaign.failedCount) / campaign.totalRecipients) * 100
+                    : 0;
+
+                return (
+                  <Grid item xs={12} md={6} lg={4} key={campaign.id}>
+                    <Card>
+                      <CardContent>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
+                          <Typography variant="h6" fontWeight="bold">
+                            {campaign.name}
+                          </Typography>
+                          <Chip
+                            label={getStatusLabel(campaign.status)}
+                            color={getStatusColor(campaign.status) as any}
+                            size="small"
+                          />
+                        </Box>
+
+                        {campaign.batchId && (
+                          <Typography variant="caption" color="primary" sx={{ display: 'block', mb: 1 }}>
+                            🔗 Batch: {campaigns.filter((c) => c.batchId === campaign.batchId).length} campaigns liên kết
+                          </Typography>
+                        )}
+
+                        {campaign.description && (
+                          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                            {campaign.description}
+                          </Typography>
+                        )}
+
+                        <Typography variant="body2" sx={{ mb: 1 }}>
+                          Template: {template?.name || 'N/A'}
+                        </Typography>
+
+                        <Typography variant="body2" sx={{ mb: 2 }}>
+                          Người nhận: {campaign.totalRecipients}
+                        </Typography>
+
+                        {campaign.status !== 'draft' && (
+                          <Box sx={{ mb: 2 }}>
+                            <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
+                              <Typography variant="caption">
+                                {campaign.sentCount + campaign.failedCount}/{campaign.totalRecipients}
+                              </Typography>
+                              <Typography variant="caption">{progress.toFixed(0)}%</Typography>
+                            </Box>
+                            <LinearProgress variant="determinate" value={progress} />
+                            <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+                              <Chip
+                                label={`Thành công: ${campaign.sentCount}`}
+                                color="success"
+                                size="small"
+                                variant="outlined"
+                              />
+                              <Chip
+                                label={`Thất bại: ${campaign.failedCount}`}
+                                color="error"
+                                size="small"
+                                variant="outlined"
+                              />
+                            </Stack>
+                          </Box>
+                        )}
+
+                        <Typography variant="caption" color="text.secondary">
+                          Tạo: {utcToVietnamTime(campaign.createdAt)}
+                        </Typography>
+                        {campaign.scheduledAt && (
+                          <Typography variant="caption" color="primary" display="block">
+                            Lên lịch: {utcToVietnamTime(campaign.scheduledAt)}
+                          </Typography>
+                        )}
+                        {campaign.rateLimit && (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            Giới hạn: {campaign.rateLimit} tin/giờ
+                          </Typography>
+                        )}
+                      </CardContent>
+
+                      <CardActions sx={{ justifyContent: 'space-between', px: 2, pb: 2 }}>
+                        <Box>
+                          {(campaign.status === 'draft' || campaign.status === 'scheduled') && (
+                            <Tooltip
+                              title={
+                                campaign.batchId
+                                  ? `Bắt đầu tất cả ${campaigns.filter((c) => c.batchId === campaign.batchId).length} campaigns trong batch`
+                                  : (campaign.status === 'scheduled' ? 'Chạy ngay' : 'Bắt đầu')
+                              }
+                            >
+                              <IconButton
+                                size="small"
+                                color="primary"
+                                onClick={() => handleStartCampaign(campaign)}
+                                disabled={runningCampaignId !== null}
+                              >
+                                <PlayArrow />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {campaign.status === 'running' && (
+                            <>
+                              <Tooltip title="Tạm dừng">
+                                <IconButton
+                                  size="small"
+                                  color="warning"
+                                  onClick={() => handlePauseCampaign(campaign.id)}
+                                >
+                                  <Pause />
+                                </IconButton>
+                              </Tooltip>
+                              <Tooltip title="Dừng">
+                                <IconButton
+                                  size="small"
+                                  color="error"
+                                  onClick={() => handleStopCampaign(campaign.id)}
+                                >
+                                  <Stop />
+                                </IconButton>
+                              </Tooltip>
+                            </>
+                          )}
+                          {campaign.status === 'paused' && (
+                            <>
+                              <Tooltip title="Tiếp tục">
+                                <IconButton
+                                  size="small"
+                                  color="primary"
+                                  onClick={() => handleResumeCampaign(campaign)}
+                                  disabled={runningCampaignId !== null}
+                                >
+                                  <PlayArrow />
+                                </IconButton>
+                              </Tooltip>
+                              <Tooltip title="Dừng">
+                                <IconButton
+                                  size="small"
+                                  color="error"
+                                  onClick={() => handleStopCampaign(campaign.id)}
+                                >
+                                  <Stop />
+                                </IconButton>
+                              </Tooltip>
+                            </>
+                          )}
+                        </Box>
+                        <Box>
+                          <Tooltip title="Xem chi tiết">
+                            <IconButton size="small" onClick={() => setViewDetailsId(campaign.id)}>
+                              <Visibility />
+                            </IconButton>
+                          </Tooltip>
+                          {(campaign.status === 'draft' || campaign.status === 'scheduled') && (
+                            <Tooltip title="Xóa">
+                              <IconButton
+                                size="small"
+                                color="error"
+                                onClick={() => setDeleteConfirmId(campaign.id)}
+                              >
+                                <Delete />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                        </Box>
+                      </CardActions>
+                    </Card>
+                  </Grid>
+                );
+              })}
+            </Grid>
+          </Box>
+        );
+      })}
+
+      {campaigns.length === 0 && !loading && (
+        <Paper sx={{ p: 4, textAlign: 'center' }}>
+          <Typography color="text.secondary">
+            Chưa có chiến dịch nào. Nhấn "Tạo Chiến Dịch" để bắt đầu.
+          </Typography>
+        </Paper>
+      )}
+
+      {/* Create Campaign Dialog */}
+      <Dialog open={openDialog} onClose={handleCloseDialog} maxWidth="xl" fullWidth>
+        <DialogTitle>Tạo Chiến Dịch Mới</DialogTitle>
+        <DialogContent>
+          {dialogError && (
+            <Alert severity="error" sx={{ mb: 2 }} onClose={() => setDialogError('')}>
+              {dialogError}
+            </Alert>
+          )}
+
+          {/* Two Column Layout */}
+          <Grid container spacing={3} sx={{ pt: 1 }}>
+            {/* Left Column - Main Form */}
+            <Grid item xs={12} md={6}>
+              <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+                Thông tin chiến dịch
+              </Typography>
+
+              {/* Account Selection - Support multiple accounts */}
+              <AccountSelector
+                mode="multiple"
+                value={formAccountIds}
+                onChange={(ids) => setFormAccountIds(ids as number[])}
+                label="Chọn tài khoản để thực hiện chiến dịch"
+                required
+                helperText="Chọn nhiều tài khoản để chia đều công việc, tránh spam một tài khoản"
+              />
+
+              <TextField
+                fullWidth
+                label="Tên chiến dịch"
+                value={formName}
+                onChange={(e) => setFormName(e.target.value)}
+                sx={{ mb: 2 }}
+              />
+
+              <TextField
+                fullWidth
+                label="Mô tả (tùy chọn)"
+                value={formDescription}
+                onChange={(e) => setFormDescription(e.target.value)}
+                multiline
+                rows={2}
+                sx={{ mb: 2 }}
+              />
+
+              {/* Campaign Type Selector */}
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Loại chiến dịch
+              </Typography>
+              {(['messaging', 'friend_request', 'group_management', 'automation'] as const).map(
+                (category) => {
+                  const types = getCampaignTypesByCategory(category);
+                  return (
+                    <Accordion key={category} defaultExpanded={category === 'messaging'}>
+                      <AccordionSummary expandIcon={<ExpandMore />}>
+                        <Typography>{CATEGORY_LABELS[category]}</Typography>
+                      </AccordionSummary>
+                      <AccordionDetails>
+                        <Grid container spacing={1}>
+                          {types.map((typeConfig) => {
+                            const Icon = typeConfig.icon;
+                            return (
+                              <Grid item xs={12} key={typeConfig.type}>
+                                <Paper
+                                  sx={{
+                                    p: 1.5,
+                                    cursor: 'pointer',
+                                    border: 2,
+                                    borderColor:
+                                      formCampaignType === typeConfig.type
+                                        ? 'primary.main'
+                                        : 'transparent',
+                                    '&:hover': {
+                                      borderColor: 'primary.light',
+                                    },
+                                  }}
+                                  onClick={() => setFormCampaignType(typeConfig.type)}
+                                >
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                    <Icon sx={{ color: typeConfig.color }} />
+                                    <Box sx={{ flex: 1 }}>
+                                      <Typography variant="body2" fontWeight="bold">
+                                        {typeConfig.label}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary">
+                                        {typeConfig.description}
+                                      </Typography>
+                                    </Box>
+                                  </Box>
+                                </Paper>
+                              </Grid>
+                            );
+                          })}
+                        </Grid>
+                      </AccordionDetails>
+                    </Accordion>
+                  );
+                }
+              )}
+
+              {/* Template Selector - conditional */}
+              {(requiresTemplate(formCampaignType) || supportsOptionalTemplate(formCampaignType)) && (
+                <FormControl fullWidth sx={{ mb: 2, mt: 2 }}>
+                  <InputLabel>
+                    Template {requiresTemplate(formCampaignType) ? '*' : '(tùy chọn - để trống dùng lời chào mặc định)'}
+                  </InputLabel>
+                  <Select
+                    value={formTemplateId || ''}
+                    onChange={(e) => setFormTemplateId(e.target.value as number)}
+                    required={requiresTemplate(formCampaignType)}
+                  >
+                    {supportsOptionalTemplate(formCampaignType) && (
+                      <MenuItem value="">
+                        <em>Không chọn (dùng lời chào mặc định)</em>
+                      </MenuItem>
+                    )}
+                    {templates.map((template) => (
+                      <MenuItem key={template.id} value={template.id}>
+                        {template.name}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              )}
+
+              {/* Group Selector - conditional */}
+              {requiresGroup(formCampaignType) && (
+                <FormControl fullWidth sx={{ mb: 2, mt: 2 }}>
+                  <InputLabel>Chọn nhóm *</InputLabel>
+                  <Select
+                    value={formGroupId || ''}
+                    onChange={(e) => setFormGroupId(e.target.value as string)}
+                    required
+                  >
+                    {groups.map((group) => (
+                      <MenuItem key={group.groupId} value={group.groupId}>
+                        {group.groupName} ({group.memberCount} thành viên)
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              )}
+
+              {/* Contact Group Selector - optional (hidden for re-marketing) */}
+              {formCampaignType !== 'message_to_friends' && (
+                <FormControl fullWidth sx={{ mb: 2, mt: 2 }}>
+                  <InputLabel>Nhóm danh bạ (tùy chọn)</InputLabel>
+                  <Select
+                    value={formContactGroupId || ''}
+                    onChange={(e) => setFormContactGroupId(e.target.value as number)}
+                  >
+                    <MenuItem value="">
+                      <em>Không chọn</em>
+                    </MenuItem>
+                    {contactGroups.map((group) => (
+                      <MenuItem key={group.id} value={group.id}>
+                        {group.name} ({group.memberCount} thành viên)
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              )}
+            </Grid>
+
+            {/* Right Column - Recipients & Settings */}
+            <Grid item xs={12} md={6}>
+              <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+                Người nhận
+              </Typography>
+
+              {/* Re-marketing: Load Previous Recipients */}
+              {formCampaignType === 'message_to_friends' && (
+                <Box sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                  <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+                    Chọn người nhận từ các chiến dịch trước
+                  </Typography>
+                  <Stack spacing={2}>
+                    <TextField
+                      fullWidth
+                      label="Từ ngày (tùy chọn)"
+                      type="date"
+                      value={remarketingDateFrom}
+                      onChange={(e) => setRemarketingDateFrom(e.target.value)}
+                      InputLabelProps={{ shrink: true }}
+                      size="small"
+                    />
+                    <TextField
+                      fullWidth
+                      label="Đến ngày (tùy chọn)"
+                      type="date"
+                      value={remarketingDateTo}
+                      onChange={(e) => setRemarketingDateTo(e.target.value)}
+                      InputLabelProps={{ shrink: true }}
+                      size="small"
+                    />
+                    <Button
+                      variant="contained"
+                      onClick={loadPreviousRecipientsForRemarketing}
+                      disabled={loadingPreviousRecipients || formAccountIds.length === 0}
+                      startIcon={loadingPreviousRecipients ? <CircularProgress size={20} /> : <Refresh />}
+                      fullWidth
+                    >
+                      {loadingPreviousRecipients ? 'Đang tải...' : 'Tải danh sách'}
+                    </Button>
+                    <Typography variant="caption" color="text.secondary">
+                      {remarketingDateFrom || remarketingDateTo
+                        ? 'Lọc theo khoảng thời gian đã chọn'
+                        : 'Không lọc thời gian - lấy tất cả người nhận'}
+                    </Typography>
+                  </Stack>
+
+                  {/* Display previous recipients list with checkboxes */}
+                  {previousRecipients.length > 0 && (
+                    <Box sx={{ mt: 2, maxHeight: 400, overflow: 'auto' }}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+                        <Typography variant="subtitle2" fontWeight="bold">
+                          Danh sách ({previousRecipients.length} người)
+                        </Typography>
+                        <Stack direction="row" spacing={1}>
+                          <Button
+                            size="small"
+                            onClick={() => {
+                              const allRecipients: Recipient[] = previousRecipients.map((prev) => ({
+                                userId: prev.userId,
+                                displayName: prev.displayName,
+                                phoneNumber: prev.phoneNumber,
+                                variables: {},
+                                source: 'excel' as const,
+                              }));
+                              setFormRecipients(allRecipients);
+                            }}
+                          >
+                            Chọn tất cả
+                          </Button>
+                          <Button size="small" onClick={() => setFormRecipients([])}>
+                            Bỏ chọn
+                          </Button>
+                        </Stack>
+                      </Stack>
+                      {previousRecipients.map((prev) => {
+                        const isSelected = formRecipients.some((r) => r.userId === prev.userId);
+                        return (
+                          <Box
+                            key={prev.userId}
+                            sx={{
+                              p: 1,
+                              mb: 0.5,
+                              border: 1,
+                              borderColor: isSelected ? 'primary.main' : 'divider',
+                              borderRadius: 1,
+                              cursor: 'pointer',
+                              bgcolor: isSelected ? 'primary.light' : 'transparent',
+                              '&:hover': { bgcolor: isSelected ? 'primary.light' : 'action.hover' },
+                            }}
+                            onClick={() => {
+                              if (isSelected) {
+                                setFormRecipients(formRecipients.filter((r) => r.userId !== prev.userId));
+                              } else {
+                                setFormRecipients([
+                                  ...formRecipients,
+                                  {
+                                    userId: prev.userId,
+                                    displayName: prev.displayName,
+                                    phoneNumber: prev.phoneNumber,
+                                    variables: {},
+                                    source: 'excel' as const,
+                                  },
+                                ]);
+                              }
+                            }}
+                          >
+                            <Stack direction="row" alignItems="center" spacing={1}>
+                              <Checkbox checked={isSelected} size="small" />
+                              <Avatar sx={{ width: 32, height: 32 }}>{prev.displayName.charAt(0)}</Avatar>
+                              <Box flex={1}>
+                                <Typography variant="body2" fontWeight={isSelected ? 'bold' : 'normal'}>
+                                  {prev.displayName}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {prev.phoneNumber || prev.userId}
+                                  {prev.lastSentAt && ` • Gửi lần cuối: ${new Date(prev.lastSentAt).toLocaleDateString('vi-VN')}`}
+                                </Typography>
+                              </Box>
+                            </Stack>
+                          </Box>
+                        );
+                      })}
+                    </Box>
+                  )}
+
+                  {formRecipients.length > 0 && (
+                    <Box sx={{ mt: 2, p: 1, bgcolor: 'success.light', borderRadius: 1 }}>
+                      <Typography variant="body2" color="success.dark" fontWeight="bold">
+                        ✓ Đã chọn {formRecipients.length} người nhận
+                      </Typography>
+                    </Box>
+                  )}
+                </Box>
+              )}
+
+              {/* Recipients Upload Section (hidden for re-marketing) */}
+              {formCampaignType !== 'message_to_friends' && (
+                <Box sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                  <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                    Danh sách người nhận {activeRecipients.length > 0 && `(${activeRecipients.length})`}
+                  </Typography>
+                  <Stack direction="row" spacing={1} sx={{ mb: 2 }}>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      startIcon={<FileDownload />}
+                      onClick={() => {
+                        const selectedTemplateCurrent = templates.find((t) => t.id === formTemplateId);
+                        downloadBulkSendTemplate(selectedTemplateCurrent?.variables || []);
+                      }}
+                      disabled={!formTemplateId}
+                    >
+                      Tải file mẫu
+                    </Button>
+                    <input
+                      accept=".xlsx,.xls"
+                      style={{ display: 'none' }}
+                      id="import-recipients-excel"
+                      type="file"
+                      onChange={handleImportRecipients}
+                      disabled={!formTemplateId}
+                    />
+                    <label htmlFor="import-recipients-excel">
+                      <Button
+                        variant="contained"
+                        component="span"
+                        size="small"
+                        startIcon={<FileUpload />}
+                        disabled={!formTemplateId}
+                      >
+                        Nhập Excel
+                      </Button>
+                    </label>
+                  </Stack>
+                  {!formTemplateId && (
+                    <Typography variant="caption" color="text.secondary">
+                      Vui lòng chọn template trước khi nhập danh sách người nhận
+                    </Typography>
+                  )}
+                  {activeRecipients.length > 0 && (
+                    <Box sx={{ mt: 2 }}>
+                      <Typography variant="caption" color="success.main" fontWeight="bold">
+                        ✓ Đã tải {activeRecipients.length} người nhận
+                      </Typography>
+                      {formAccountIds.length > 1 && (
+                        <Typography variant="caption" color="primary.main" sx={{ display: 'block', mt: 0.5 }}>
+                          → Sẽ chia đều cho {formAccountIds.length} tài khoản (~{Math.ceil(activeRecipients.length / formAccountIds.length)} người/tài khoản)
+                        </Typography>
+                      )}
+                    </Box>
+                  )}
+                </Box>
+              )}
+
+              {/* Scheduled At - optional */}
+              <TextField
+                fullWidth
+                label="Thời gian thực hiện"
+                type="datetime-local"
+                value={formScheduledAt}
+                onChange={(e) => setFormScheduledAt(e.target.value)}
+                InputLabelProps={{ shrink: true }}
+                helperText="Mặc định: 5 phút kể từ khi tạo chiến dịch"
+                sx={{ mb: 2 }}
+              />
+
+              {/* Advanced Rate Limiting Settings */}
+              <Box sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+                  Cài đặt giới hạn gửi
+                </Typography>
+
+                <TextField
+                  fullWidth
+                  label="Thời gian nghỉ giữa 2 lần gửi (giây)"
+                  type="number"
+                  value={formDelayBetweenMessages}
+                  onChange={(e) => setFormDelayBetweenMessages(parseInt(e.target.value))}
+                  helperText="Gợi ý: Tin nhắn không có hình ảnh: 40s, Có hình ảnh/file: 60-100s"
+                  sx={{ mb: 2 }}
+                  InputProps={{ inputProps: { min: 10 } }}
+                />
+
+                <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+                  <TextField
+                    fullWidth
+                    label="Giới hạn số tin gửi"
+                    type="number"
+                    value={formMaxMessagesPerHour}
+                    onChange={(e) => setFormMaxMessagesPerHour(parseInt(e.target.value))}
+                    InputProps={{ inputProps: { min: 1 } }}
+                  />
+                  <TextField
+                    fullWidth
+                    label="Trong số phút là"
+                    type="number"
+                    value={formTimeWindowMinutes}
+                    onChange={(e) => setFormTimeWindowMinutes(parseInt(e.target.value))}
+                    InputProps={{ inputProps: { min: 10 } }}
+                  />
+                </Box>
+
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                  💡 Gợi ý: Tài khoản thường: 15-20 tin/giờ | Tài khoản Zalo OA: 30-40 tin/giờ
+                </Typography>
+
+                <TextField
+                  fullWidth
+                  label="Thời gian nghỉ sau khi hết giới hạn (phút)"
+                  type="number"
+                  value={formRestMinutes}
+                  onChange={(e) => setFormRestMinutes(parseInt(e.target.value))}
+                  helperText="Thời gian chờ trước khi tiếp tục gửi sau khi đạt giới hạn"
+                  InputProps={{ inputProps: { min: 5 } }}
+                />
+              </Box>
+
+              <TextField
+                fullWidth
+                label="Số lần thử lại khi gửi thất bại"
+                type="number"
+                value={formMaxRetries}
+                onChange={(e) => setFormMaxRetries(parseInt(e.target.value))}
+                helperText="Số lần thử lại tự động khi gửi tin nhắn thất bại"
+                InputProps={{ inputProps: { min: 0, max: 5 } }}
+              />
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseDialog}>Hủy</Button>
+          <Button onClick={handleCreateCampaign} variant="contained" disabled={loading}>
+            {loading ? <CircularProgress size={24} /> : 'Tạo'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog
+        open={deleteConfirmId !== null}
+        onClose={() => setDeleteConfirmId(null)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>Xác nhận xóa</DialogTitle>
+        <DialogContent>
+          <Typography>Bạn có chắc chắn muốn xóa chiến dịch này không?</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteConfirmId(null)}>Hủy</Button>
+          <Button
+            onClick={() => deleteConfirmId && handleDeleteCampaign(deleteConfirmId)}
+            variant="contained"
+            color="error"
+            disabled={loading}
+          >
+            {loading ? <CircularProgress size={24} /> : 'Xóa'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* View Details Dialog */}
+      <Dialog
+        open={viewDetailsId !== null}
+        onClose={() => setViewDetailsId(null)}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Chi Tiết Chiến Dịch</DialogTitle>
+        <DialogContent>
+          {viewDetailsId && campaigns.find((c) => c.id === viewDetailsId) && (
+            <Box>
+              {(() => {
+                const campaign = campaigns.find((c) => c.id === viewDetailsId)!;
+                const template = templates.find((t) => t.id === campaign.templateId);
+                return (
+                  <>
+                    <Typography variant="subtitle2" gutterBottom>
+                      Tên: {campaign.name}
+                    </Typography>
+                    {campaign.description && (
+                      <Typography variant="body2" gutterBottom>
+                        Mô tả: {campaign.description}
+                      </Typography>
+                    )}
+                    <Typography variant="body2" gutterBottom>
+                      Template: {template?.name || 'N/A'}
+                    </Typography>
+                    <Typography variant="body2" gutterBottom>
+                      Độ trễ: {campaign.delayMs}ms
+                    </Typography>
+                    <Typography variant="body2" gutterBottom>
+                      Số lần thử lại: {campaign.maxRetries}
+                    </Typography>
+                    <Typography variant="body2" gutterBottom>
+                      Trạng thái: {getStatusLabel(campaign.status)}
+                    </Typography>
+                    <Typography variant="body2" gutterBottom>
+                      Tổng người nhận: {campaign.totalRecipients}
+                    </Typography>
+                    <Typography variant="body2" gutterBottom>
+                      Đã gửi: {campaign.sentCount}
+                    </Typography>
+                    <Typography variant="body2" gutterBottom>
+                      Thất bại: {campaign.failedCount}
+                    </Typography>
+                  </>
+                );
+              })()}
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setViewDetailsId(null)}>Đóng</Button>
+        </DialogActions>
+      </Dialog>
+        </>
+      ) : (
+        // Create Campaign View
+        <Box>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              <IconButton onClick={() => setViewMode('list')}>
+                <ArrowBack />
+              </IconButton>
+              <Typography variant="h5" fontWeight="bold">
+                Tạo Chiến Dịch Mới
+              </Typography>
+            </Box>
+          </Box>
+
+          {error && (
+            <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>
+              {error}
+            </Alert>
+          )}
+
+          {success && (
+            <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess('')}>
+              {success}
+            </Alert>
+          )}
+
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+            Tạo chiến dịch mới để gửi tin nhắn, kết bạn, hoặc tham gia nhóm
+          </Typography>
+
+          {/* Create Campaign Form */}
+          <Grid container spacing={3}>
+            {/* Left Column - Main Form */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 3 }}>
+                <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+                  Thông tin chiến dịch
+                </Typography>
+
+                {/* Account Selection */}
+                <Box sx={{ mb: 2 }}>
+                  <AccountSelector
+                    mode="multiple"
+                    value={formAccountIds}
+                    onChange={(ids) => setFormAccountIds(ids as number[])}
+                    label="Chọn tài khoản để thực hiện chiến dịch"
+                    required
+                    helperText={fieldErrors.accountIds || "Chọn nhiều tài khoản để chia đều công việc, tránh spam một tài khoản"}
+                  />
+                  {fieldErrors.accountIds && (
+                    <Typography variant="caption" color="error" sx={{ mt: 0.5, ml: 1.5, display: 'block' }}>
+                      {fieldErrors.accountIds}
+                    </Typography>
+                  )}
+                </Box>
+
+                <TextField
+                  fullWidth
+                  label="Tên chiến dịch"
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
+                  sx={{ mb: 2, mt: 2 }}
+                  required
+                  error={!!fieldErrors.name}
+                  helperText={fieldErrors.name}
+                />
+
+                <TextField
+                  fullWidth
+                  label="Mô tả (tùy chọn)"
+                  value={formDescription}
+                  onChange={(e) => setFormDescription(e.target.value)}
+                  multiline
+                  rows={2}
+                  sx={{ mb: 2 }}
+                />
+
+                {/* Campaign Type Selector */}
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Loại chiến dịch
+                </Typography>
+                {(['messaging', 'friend_request', 'group_management', 'automation'] as const).map(
+                  (category) => {
+                    const types = getCampaignTypesByCategory(category);
+                    return (
+                      <Accordion key={category} defaultExpanded={category === 'messaging'}>
+                        <AccordionSummary expandIcon={<ExpandMore />}>
+                          <Typography>{CATEGORY_LABELS[category]}</Typography>
+                        </AccordionSummary>
+                        <AccordionDetails>
+                          <Grid container spacing={1}>
+                            {types.map((typeConfig) => {
+                              const Icon = typeConfig.icon;
+                              return (
+                                <Grid item xs={12} key={typeConfig.type}>
+                                  <Paper
+                                    sx={{
+                                      p: 1.5,
+                                      cursor: 'pointer',
+                                      border: 2,
+                                      borderColor:
+                                        formCampaignType === typeConfig.type
+                                          ? 'primary.main'
+                                          : 'transparent',
+                                      '&:hover': {
+                                        borderColor: 'primary.light',
+                                      },
+                                    }}
+                                    onClick={() => setFormCampaignType(typeConfig.type)}
+                                  >
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                      <Icon sx={{ color: typeConfig.color }} />
+                                      <Box sx={{ flex: 1 }}>
+                                        <Typography variant="body2" fontWeight="bold">
+                                          {typeConfig.label}
+                                        </Typography>
+                                        <Typography variant="caption" color="text.secondary">
+                                          {typeConfig.description}
+                                        </Typography>
+                                      </Box>
+                                    </Box>
+                                  </Paper>
+                                </Grid>
+                              );
+                            })}
+                          </Grid>
+                        </AccordionDetails>
+                      </Accordion>
+                    );
+                  }
+                )}
+
+                {/* Template Selector */}
+                {(requiresTemplate(formCampaignType) || supportsOptionalTemplate(formCampaignType)) && (
+                  <FormControl fullWidth sx={{ mb: 2, mt: 2 }} error={!!fieldErrors.templateId}>
+                    <InputLabel>
+                      Template {requiresTemplate(formCampaignType) ? '*' : '(tùy chọn - để trống dùng lời chào mặc định)'}
+                    </InputLabel>
+                    <Select
+                      value={formTemplateId || ''}
+                      onChange={(e) => setFormTemplateId(e.target.value as number)}
+                      required={requiresTemplate(formCampaignType)}
+                      error={!!fieldErrors.templateId}
+                    >
+                      {supportsOptionalTemplate(formCampaignType) && (
+                        <MenuItem value="">
+                          <em>Không chọn (dùng lời chào mặc định)</em>
+                        </MenuItem>
+                      )}
+                      {templates.map((template) => (
+                        <MenuItem key={template.id} value={template.id}>
+                          {template.name}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                    {fieldErrors.templateId && (
+                      <Typography variant="caption" color="error" sx={{ mt: 0.5, ml: 1.5 }}>
+                        {fieldErrors.templateId}
+                      </Typography>
+                    )}
+                  </FormControl>
+                )}
+
+                {/* Group Selector for group-based campaigns */}
+                {requiresGroup(formCampaignType) && (
+                  <Box sx={{ mb: 2, mt: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                    <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+                      Chọn nhóm Zalo
+                    </Typography>
+
+                    {/* Show method toggle only for campaign types that support link */}
+                    {(formCampaignType === 'message_to_group_members' || formCampaignType === 'friend_request_group') && (
+                      <FormControl component="fieldset" sx={{ mb: 2 }}>
+                        <Typography variant="caption" sx={{ mb: 1, display: 'block' }}>
+                          Phương thức:
+                        </Typography>
+                        <Box sx={{ display: 'flex', gap: 2 }}>
+                          <Chip
+                            label="Nhóm đã tham gia"
+                            onClick={() => setGroupLoadMethod('existing')}
+                            color={groupLoadMethod === 'existing' ? 'primary' : 'default'}
+                            variant={groupLoadMethod === 'existing' ? 'filled' : 'outlined'}
+                          />
+                          <Chip
+                            label="Link mời nhóm"
+                            onClick={() => setGroupLoadMethod('link')}
+                            color={groupLoadMethod === 'link' ? 'primary' : 'default'}
+                            variant={groupLoadMethod === 'link' ? 'filled' : 'outlined'}
+                          />
+                        </Box>
+                      </FormControl>
+                    )}
+
+                    {groupLoadMethod === 'existing' || formCampaignType === 'message_to_group' || formCampaignType === 'add_to_group' ? (
+                      <FormControl fullWidth error={!!fieldErrors.groupId}>
+                        <InputLabel>Chọn nhóm *</InputLabel>
+                        <Select
+                          value={formGroupId || ''}
+                          onChange={(e) => setFormGroupId(e.target.value as string)}
+                          required
+                          error={!!fieldErrors.groupId}
+                        >
+                          {groups.map((group) => (
+                            <MenuItem key={group.groupId} value={group.groupId}>
+                              {group.groupName} ({group.memberCount} thành viên)
+                            </MenuItem>
+                          ))}
+                        </Select>
+                        {fieldErrors.groupId && (
+                          <Typography variant="caption" color="error" sx={{ mt: 0.5, ml: 1.5 }}>
+                            {fieldErrors.groupId}
+                          </Typography>
+                        )}
+                      </FormControl>
+                    ) : (
+                      <TextField
+                        fullWidth
+                        label="Link mời nhóm"
+                        placeholder="https://zalo.me/g/..."
+                        value={groupLink}
+                        onChange={(e) => setGroupLink(e.target.value)}
+                        helperText={fieldErrors.groupLink || "Nhập link mời để quét thành viên nhóm chưa tham gia"}
+                        error={!!fieldErrors.groupLink}
+                      />
+                    )}
+
+                    <Button
+                      fullWidth
+                      variant="contained"
+                      onClick={handleLoadGroupMembers}
+                      disabled={loadingGroupMembers || (!formGroupId && !groupLink)}
+                      sx={{ mt: 2 }}
+                      startIcon={loadingGroupMembers ? <CircularProgress size={20} /> : <Refresh />}
+                    >
+                      {loadingGroupMembers ? 'Đang load...' : 'Load thành viên nhóm'}
+                    </Button>
+
+                    {fieldErrors.recipients && (
+                      <Alert severity="error" sx={{ mt: 2 }}>
+                        {fieldErrors.recipients}
+                      </Alert>
+                    )}
+                  </Box>
+                )}
+
+                {/* Contact Group Selector */}
+                {!requiresGroup(formCampaignType) && (
+                  <FormControl fullWidth sx={{ mb: 2, mt: 2 }}>
+                    <InputLabel>Nhóm danh bạ (tùy chọn)</InputLabel>
+                    <Select
+                      value={formContactGroupId || ''}
+                      onChange={(e) => setFormContactGroupId(e.target.value as number)}
+                    >
+                      <MenuItem value="">
+                        <em>Không chọn</em>
+                      </MenuItem>
+                      {contactGroups.map((group) => (
+                        <MenuItem key={group.id} value={group.id}>
+                          {group.name} ({group.memberCount} thành viên)
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                )}
+              </Paper>
+            </Grid>
+
+            {/* Right Column - Recipients & Settings */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 3 }}>
+                <Typography variant="h6" sx={{ mb: 2, fontWeight: 600 }}>
+                  Người nhận & Cấu hình
+                </Typography>
+
+                {/* Group Members Selection - Show only for group campaigns */}
+                {requiresGroup(formCampaignType) && groupMembers.length > 0 && (
+                  <Box sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                    <Alert severity="warning" sx={{ mb: 2 }}>
+                      ⚠️ Không nên gửi tin nhắn cho Quản trị viên nhóm (Admin, Phó nhóm)
+                    </Alert>
+
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                        Chọn thành viên nhận tin ({activeRecipients.length}/{groupMembers.length})
+                      </Typography>
+                      <Stack direction="row" spacing={1}>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => {
+                            const allRecipients: Recipient[] = groupMembers.map((m: any) => ({
+                              userId: m.userId,
+                              displayName: m.displayName,
+                              variables: {},
+                              source: 'group' as const,
+                            }));
+                            setFormRecipients(allRecipients);
+                          }}
+                        >
+                          Chọn tất cả
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="contained"
+                          onClick={() => {
+                            const nonAdminRecipients: Recipient[] = groupMembers
+                              .filter((m: any) => {
+                                const roleUpper = m.role ? m.role.toUpperCase() : '';
+                                return roleUpper !== 'OWNER' && roleUpper !== 'ADMIN';
+                              })
+                              .map((m: any) => ({
+                                userId: m.userId,
+                                displayName: m.displayName,
+                                variables: {},
+                                source: 'group' as const,
+                              }));
+                            setFormRecipients(nonAdminRecipients);
+                          }}
+                        >
+                          Chọn tất cả trừ admin
+                        </Button>
+                      </Stack>
+                    </Box>
+
+                    <Box sx={{ maxHeight: 400, overflowY: 'auto' }}>
+                      <Stack spacing={1}>
+                        {groupMembers
+                          .slice()
+                          .sort((a: any, b: any) => {
+                            // Sort by role: OWNER → ADMIN → MEMBER
+                            const roleOrder: Record<string, number> = {
+                              OWNER: 1,
+                              ADMIN: 2,
+                              MEMBER: 3,
+                            };
+                            const roleA = (a.role || 'MEMBER').toUpperCase();
+                            const roleB = (b.role || 'MEMBER').toUpperCase();
+                            return (roleOrder[roleA] || 999) - (roleOrder[roleB] || 999);
+                          })
+                          .map((member) => {
+                          const isSelected = formRecipients.some((r) => r.userId === member.userId);
+                          const roleUpper = member.role ? member.role.toUpperCase() : '';
+                          const isAdmin = roleUpper === 'OWNER' || roleUpper === 'ADMIN';
+
+                          // Map role to Vietnamese label
+                          const getRoleLabel = (role: string) => {
+                            const upperRole = role.toUpperCase();
+                            if (upperRole === 'OWNER') return 'Trưởng nhóm';
+                            if (upperRole === 'ADMIN') return 'Phó nhóm';
+                            return 'Thành viên';
+                          };
+
+                          return (
+                            <Box
+                              key={member.userId}
+                              sx={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                p: 1,
+                                border: 1,
+                                borderColor: isAdmin ? 'warning.main' : 'divider',
+                                borderRadius: 1,
+                                bgcolor: isSelected ? 'action.selected' : 'background.paper',
+                                cursor: 'pointer',
+                                '&:hover': {
+                                  bgcolor: 'action.hover',
+                                },
+                              }}
+                              onClick={() => handleSelectGroupMember(member)}
+                            >
+                              <Checkbox checked={isSelected} />
+                              <Avatar src={member.avatar} sx={{ width: 32, height: 32, mr: 1 }} />
+                              <Box sx={{ flex: 1 }}>
+                                <Typography variant="body2">{member.displayName}</Typography>
+                                {member.role && (
+                                  <Chip
+                                    label={getRoleLabel(member.role)}
+                                    size="small"
+                                    color={isAdmin ? 'warning' : 'default'}
+                                    sx={{ mt: 0.5 }}
+                                  />
+                                )}
+                              </Box>
+                            </Box>
+                          );
+                        })}
+                      </Stack>
+                    </Box>
+                  </Box>
+                )}
+
+                {/* Recipients Upload Section - Show only for non-group campaigns */}
+                {!requiresGroup(formCampaignType) && (
+                  <Box sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                    <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                      Danh sách người nhận {formRecipients.length > 0 && `(${formRecipients.length})`}
+                    </Typography>
+
+                    {/* Phone Number Input Section - Only for phone-based campaigns */}
+                    {supportsPhoneInput(formCampaignType) && (
+                      <Box sx={{ mb: 2, p: 2, border: 1, borderColor: 'divider', borderRadius: 1 }}>
+                        <Typography variant="caption" sx={{ mb: 1, display: 'block', fontWeight: 600 }}>
+                          Nhập số điện thoại trực tiếp
+                        </Typography>
+                        <TextField
+                          fullWidth
+                          multiline
+                          rows={3}
+                          placeholder="Nhập số điện thoại (phân cách bằng dấu phẩy)&#10;Ví dụ: 0912345678, 0987654321, 0909123456"
+                          value={phoneInput}
+                          onChange={(e) => setPhoneInput(e.target.value)}
+                          disabled={requiresTemplate(formCampaignType) && !formTemplateId}
+                          sx={{ mb: 1 }}
+                          size="small"
+                        />
+                        <Button
+                          variant="contained"
+                          size="small"
+                          onClick={handleAddPhoneNumbers}
+                          disabled={(requiresTemplate(formCampaignType) && !formTemplateId) || !phoneInput.trim()}
+                        >
+                          Thêm số điện thoại
+                        </Button>
+                        {requiresTemplate(formCampaignType) && !formTemplateId && (
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+                            Vui lòng chọn template trước
+                          </Typography>
+                        )}
+                      </Box>
+                    )}
+
+                    {/* Excel Import Section */}
+                    {supportsPhoneInput(formCampaignType) && (
+                      <Typography variant="caption" sx={{ mb: 1, display: 'block', fontWeight: 600 }}>
+                        Hoặc nhập từ file Excel
+                      </Typography>
+                    )}
+                    <Stack direction="row" spacing={1} sx={{ mb: 2 }}>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<FileDownload />}
+                        onClick={() => {
+                          const selectedTemplateCurrent = templates.find((t) => t.id === formTemplateId);
+                          downloadBulkSendTemplate(selectedTemplateCurrent?.variables || []);
+                        }}
+                        disabled={!formTemplateId}
+                      >
+                        Tải file mẫu
+                      </Button>
+                      <input
+                        accept=".xlsx,.xls"
+                        style={{ display: 'none' }}
+                        id="import-recipients-excel-create"
+                        type="file"
+                        onChange={handleImportRecipients}
+                        disabled={!formTemplateId}
+                      />
+                      <label htmlFor="import-recipients-excel-create">
+                        <Button
+                          variant="outlined"
+                          component="span"
+                          size="small"
+                          startIcon={<FileUpload />}
+                          disabled={!formTemplateId}
+                        >
+                          Nhập Excel
+                        </Button>
+                      </label>
+                    </Stack>
+                    {activeRecipients.length > 0 && (
+                      <Box sx={{ mt: 2 }}>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                          <Typography variant="caption" color="success.main" fontWeight="bold">
+                            ✓ Đã tải {activeRecipients.length} người nhận
+                            {formRecipients.length > activeRecipients.length && (
+                              <Typography component="span" variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+                                ({formRecipients.length - activeRecipients.length} số điện thoại đã ẩn)
+                              </Typography>
+                            )}
+                          </Typography>
+                          <Button
+                            size="small"
+                            color="error"
+                            onClick={() => {
+                              if (confirm('Bạn có chắc muốn xóa tất cả người nhận?')) {
+                                setFormRecipients([]);
+                                setSuccess('Đã xóa tất cả người nhận');
+                              }
+                            }}
+                          >
+                            Xóa tất cả
+                          </Button>
+                        </Box>
+                        {formAccountIds.length > 1 && (
+                          <Typography variant="caption" color="primary.main" sx={{ display: 'block', mt: 0.5 }}>
+                            → Sẽ chia đều cho {formAccountIds.length} tài khoản (~{Math.ceil(activeRecipients.length / formAccountIds.length)} người/tài khoản)
+                          </Typography>
+                        )}
+                      </Box>
+                    )}
+
+                    {fieldErrors.recipients && (
+                      <Alert severity="error" sx={{ mt: 2 }}>
+                        {fieldErrors.recipients}
+                      </Alert>
+                    )}
+                  </Box>
+                )}
+
+                {/* Scheduled At */}
+                <TextField
+                  fullWidth
+                  label="Thời gian thực hiện"
+                  type="datetime-local"
+                  value={formScheduledAt}
+                  onChange={(e) => setFormScheduledAt(e.target.value)}
+                  InputLabelProps={{ shrink: true }}
+                  helperText={fieldErrors.scheduledAt || "Mặc định: 5 phút kể từ khi tạo chiến dịch"}
+                  error={!!fieldErrors.scheduledAt}
+                  sx={{ mb: 2 }}
+                />
+
+                {/* Advanced Rate Limiting Settings */}
+                <Box sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
+                  <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 600 }}>
+                    Cài đặt giới hạn gửi
+                  </Typography>
+
+                  <TextField
+                    fullWidth
+                    label="Thời gian nghỉ giữa 2 lần gửi (giây)"
+                    type="number"
+                    value={formDelayBetweenMessages}
+                    onChange={(e) => setFormDelayBetweenMessages(parseInt(e.target.value))}
+                    helperText="Gợi ý: Tin nhắn không có hình ảnh: 40s, Có hình ảnh/file: 60-100s"
+                    sx={{ mb: 2 }}
+                    InputProps={{ inputProps: { min: 10 } }}
+                  />
+
+                  <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+                    <TextField
+                      fullWidth
+                      label="Giới hạn số tin gửi"
+                      type="number"
+                      value={formMaxMessagesPerHour}
+                      onChange={(e) => setFormMaxMessagesPerHour(parseInt(e.target.value))}
+                      InputProps={{ inputProps: { min: 1 } }}
+                    />
+                    <TextField
+                      fullWidth
+                      label="Trong số phút là"
+                      type="number"
+                      value={formTimeWindowMinutes}
+                      onChange={(e) => setFormTimeWindowMinutes(parseInt(e.target.value))}
+                      InputProps={{ inputProps: { min: 10 } }}
+                    />
+                  </Box>
+
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                    💡 Gợi ý: Tài khoản thường: 15-20 tin/giờ | Tài khoản Zalo OA: 30-40 tin/giờ
+                  </Typography>
+
+                  <TextField
+                    fullWidth
+                    label="Thời gian nghỉ sau khi hết giới hạn (phút)"
+                    type="number"
+                    value={formRestMinutes}
+                    onChange={(e) => setFormRestMinutes(parseInt(e.target.value))}
+                    helperText="Thời gian chờ trước khi tiếp tục gửi sau khi đạt giới hạn"
+                    InputProps={{ inputProps: { min: 5 } }}
+                  />
+                </Box>
+
+                <TextField
+                  fullWidth
+                  label="Số lần thử lại khi gửi thất bại"
+                  type="number"
+                  value={formMaxRetries}
+                  onChange={(e) => setFormMaxRetries(parseInt(e.target.value))}
+                  helperText="Số lần thử lại tự động khi gửi tin nhắn thất bại"
+                  InputProps={{ inputProps: { min: 0, max: 5 } }}
+                />
+
+                {/* Create Button */}
+                <Box sx={{ mt: 3, display: 'flex', gap: 2 }}>
+                  <Button
+                    fullWidth
+                    variant="outlined"
+                    onClick={() => setViewMode('list')}
+                  >
+                    Hủy
+                  </Button>
+                  <Button
+                    fullWidth
+                    variant="contained"
+                    onClick={handleCreateCampaign}
+                    disabled={loading}
+                    startIcon={loading ? <CircularProgress size={20} /> : <Add />}
+                  >
+                    {loading ? 'Đang tạo...' : 'Tạo Chiến Dịch'}
+                  </Button>
+                </Box>
+              </Paper>
+            </Grid>
+          </Grid>
+        </Box>
+      )}
+    </Box>
+  );
+};
+
+export default CampaignsPanel;

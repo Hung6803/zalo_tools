@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"D:/Project/SourceCode/clone_akabiz/.venv/Scripts/python.exe\" test_api_response.py)",
+      "Bash(npm install:*)",
+      "Bash(timeout 5 node:*)",
+      "Bash(tree:*)",
+      "Bash(dir:*)",
+      "Bash(npx @nestjs/cli new:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

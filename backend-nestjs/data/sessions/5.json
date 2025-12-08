@@ -1,0 +1,51 @@
+{
+  "imei": "3a6429a0-88bc-43b6-9650-a5ea9e517308-a69b52f9d7f760edf3fd052bcda2542f",
+  "cookie": [
+    {
+      "key": "_zlang",
+      "value": "vn",
+      "domain": "zalo.me",
+      "path": "/",
+      "hostOnly": false,
+      "creation": "2025-11-12T11:07:27.214Z",
+      "lastAccessed": "2025-11-12T11:07:27.523Z"
+    },
+    {
+      "key": "zpsid",
+      "value": "ESf3.448115993.0.5ycz4v_Qmf26RtUAazh2aEgfiAIhulEXgkFxev4o9db7fPVfdhIeXFRQmf0",
+      "maxAge": 31536000,
+      "domain": "zalo.me",
+      "path": "/",
+      "secure": true,
+      "httpOnly": true,
+      "hostOnly": false,
+      "creation": "2025-11-12T11:07:27.214Z",
+      "lastAccessed": "2025-11-12T11:07:27.523Z",
+      "sameSite": "none"
+    },
+    {
+      "key": "zpw_sek",
+      "value": "xNqE.448115993.a0.eLBik2fDTnip-C812qrt6r5l4d08TrLD7nyvGXaE44D0THn8QNmUB443CbHTS4evLqEV_yEL24vJJ1fnFYHt6m",
+      "maxAge": 7776000,
+      "domain": "chat.zalo.me",
+      "path": "/",
+      "secure": true,
+      "httpOnly": true,
+      "hostOnly": false,
+      "creation": "2025-11-12T11:07:27.214Z",
+      "lastAccessed": "2025-11-12T11:07:27.523Z",
+      "sameSite": "lax"
+    },
+    {
+      "key": "app.event.zalo.me",
+      "value": "2714473916379996962",
+      "domain": "zalo.me",
+      "path": "/",
+      "hostOnly": false,
+      "creation": "2025-11-12T11:07:27.404Z",
+      "lastAccessed": "2025-11-12T11:07:27.523Z"
+    }
+  ],
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+  "language": "vi"
+}
