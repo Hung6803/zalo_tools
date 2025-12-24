@@ -20,6 +20,33 @@ async function bootstrap() {
     credentials: true,
   });
 
+  // Allowed Hosts validation middleware
+  const allowedHosts = configService.get('ALLOWED_HOSTS', 'localhost,127.0.0.1');
+  const allowedHostsList = allowedHosts.split(',').map((h: string) => h.trim());
+
+  app.use((req: any, res: any, next: any) => {
+    // Skip validation if ALLOWED_HOSTS contains '*'
+    if (allowedHostsList.includes('*')) {
+      return next();
+    }
+
+    const host = req.headers.host?.split(':')[0]; // Remove port if present
+    if (host && allowedHostsList.includes(host)) {
+      return next();
+    }
+
+    // Allow requests without host header (some internal requests)
+    if (!host) {
+      return next();
+    }
+
+    return res.status(403).json({
+      statusCode: 403,
+      message: `Host '${host}' is not allowed`,
+      error: 'Forbidden',
+    });
+  });
+
   // Global exception filter
   app.useGlobalFilters(new HttpExceptionFilter());
 

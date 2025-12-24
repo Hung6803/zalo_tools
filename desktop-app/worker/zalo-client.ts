@@ -1091,7 +1091,7 @@ export class ZaloClient {
         link: groupLink,
         memberPage: 1,
       });
-
+      console.log(groupLinkInfo)
       console.log(`📊 Group info (page 1):`, JSON.stringify(groupLinkInfo, null, 2));
 
       if (!groupLinkInfo || !groupLinkInfo.groupId) {
